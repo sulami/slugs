@@ -1678,6 +1678,8 @@ fn process_pending_explosions(
         (&Transform, &Sprite, &mut Health),
         (With<Wall>, Without<PendingExplosion>, Without<PlayerBase>, Without<AALauncher>),
     >,
+    projectiles: Query<(Entity, &Transform, &Projectile), Without<PendingExplosion>>,
+    aa_missiles: Query<(Entity, &Transform), (With<AAMissile>, Without<PendingExplosion>)>,
 ) {
     for (entity, transform, explosion) in &pending {
         let pos = transform.translation.truncate();
@@ -1739,6 +1741,31 @@ fn process_pending_explosions(
                 } else if distance < explosion.blast_radius {
                     let damage_factor = 1.0 - (distance / explosion.blast_radius);
                     health.take_damage(explosion.damage * damage_factor);
+                }
+            }
+
+            // Destroy projectiles caught in blast (triggers chain reaction)
+            for (proj_entity, proj_transform, projectile) in &projectiles {
+                let proj_pos = proj_transform.translation.truncate();
+                let distance = pos.distance(proj_pos);
+
+                if distance < explosion.blast_radius {
+                    // Spawn explosion for this projectile
+                    let stats = projectile.weapon.stats();
+                    spawn_explosion(&mut commands, proj_pos, stats.damage, stats.blast_radius);
+                    commands.entity(proj_entity).despawn();
+                }
+            }
+
+            // Destroy AA missiles caught in blast (triggers chain reaction)
+            for (missile_entity, missile_transform) in &aa_missiles {
+                let missile_pos = missile_transform.translation.truncate();
+                let distance = pos.distance(missile_pos);
+
+                if distance < explosion.blast_radius {
+                    // AA missiles have a small explosion
+                    spawn_explosion(&mut commands, missile_pos, 1.0, 20.0);
+                    commands.entity(missile_entity).despawn();
                 }
             }
 
