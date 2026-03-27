@@ -82,6 +82,7 @@ fn main() {
                 aa_fire_missiles,
                 update_aa_missiles,
                 check_projectile_phase_end,
+                process_pending_explosions,
                 update_explosions,
                 rebuild_terrain_mesh,
                 update_falling_entities,
@@ -422,6 +423,13 @@ struct Explosion {
     timer: f32,
     max_time: f32,
     max_radius: f32,
+}
+
+/// Marker for pending explosions that need to apply damage
+#[derive(Component)]
+struct PendingExplosion {
+    damage: f32,
+    blast_radius: f32,
 }
 
 #[derive(Component)]
@@ -1399,19 +1407,10 @@ fn update_charge_indicator(
 fn update_projectiles(
     mut commands: Commands,
     mut game_state: ResMut<GameState>,
-    mut terrain_data: ResMut<TerrainData>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    terrain_data: Res<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Sprite)>,
-    mut player_bases: Query<
-        (Entity, &Transform, &PlayerBase, &mut Health),
-        (Without<Projectile>, Without<AALauncher>),
-    >,
-    mut aa_launchers: Query<
-        (Entity, &Transform, &AALauncher, &mut Health),
-        (Without<Projectile>, Without<PlayerBase>),
-    >,
+    player_bases: Query<&Transform, (With<PlayerBase>, Without<Projectile>)>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -1424,6 +1423,7 @@ fn update_projectiles(
     // Collect entities to despawn and submunitions to spawn (to avoid borrow issues)
     let mut to_despawn = Vec::new();
     let mut submunitions_to_spawn = Vec::new();
+    let mut explosions_to_spawn = Vec::new();
 
     for (entity, mut transform, mut projectile, sprite) in &mut projectiles {
         let prev_vel_y = projectile.prev_velocity_y;
@@ -1476,7 +1476,7 @@ fn update_projectiles(
 
         // Check direct base collision (projectile hits base directly)
         let mut hit_base_directly = false;
-        for (_, base_transform, _, _) in &player_bases {
+        for base_transform in &player_bases {
             let base_pos = base_transform.translation.truncate();
             let half_size = PLAYER_BASE_SIZE / 2.0;
 
@@ -1497,76 +1497,13 @@ fn update_projectiles(
             .unwrap_or(false);
 
         if hit_base_directly || terrain_hit {
-            // Apply blast damage to terrain
             let stats = projectile.weapon.stats();
             if stats.blast_radius > 0.0 {
-                terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
-
-                // Apply blast damage to all bases within blast radius
-                for (_, base_transform, _, mut health) in &mut player_bases {
-                    let base_pos = base_transform.translation.truncate();
-                    let half_size = PLAYER_BASE_SIZE / 2.0;
-
-                    // Calculate distance to nearest point on the base (not center)
-                    let nearest_x = pos.x.clamp(base_pos.x - half_size, base_pos.x + half_size);
-                    let nearest_y = pos.y.clamp(base_pos.y - half_size, base_pos.y + half_size);
-                    let nearest_point = Vec2::new(nearest_x, nearest_y);
-                    let distance = pos.distance(nearest_point);
-
-                    if distance <= 0.0 {
-                        // Direct hit - impact is inside the base
-                        health.take_damage(stats.damage);
-                    } else if distance < stats.blast_radius {
-                        // Damage falls off linearly with distance from edge of base
-                        let damage_factor = 1.0 - (distance / stats.blast_radius);
-                        let damage = stats.damage * damage_factor;
-                        health.take_damage(damage);
-                    }
-                }
-
-                // Apply blast damage to all AA launchers within blast radius
-                for (_, aa_transform, _, mut health) in &mut aa_launchers {
-                    let aa_pos = aa_transform.translation.truncate();
-                    let half_size = Buildable::AALauncher.size() / 2.0;
-
-                    // Calculate distance to nearest point on the AA launcher
-                    let nearest_x = pos.x.clamp(aa_pos.x - half_size, aa_pos.x + half_size);
-                    let nearest_y = pos.y.clamp(aa_pos.y - half_size, aa_pos.y + half_size);
-                    let nearest_point = Vec2::new(nearest_x, nearest_y);
-                    let distance = pos.distance(nearest_point);
-
-                    if distance <= 0.0 {
-                        health.take_damage(stats.damage);
-                    } else if distance < stats.blast_radius {
-                        let damage_factor = 1.0 - (distance / stats.blast_radius);
-                        let damage = stats.damage * damage_factor;
-                        health.take_damage(damage);
-                    }
-                }
-
-                // Spawn explosion
-                commands.spawn((
-                    Mesh2d(meshes.add(Circle::new(1.0))),
-                    MeshMaterial2d(
-                        materials.add(ColorMaterial::from_color(Color::srgba(1.0, 0.6, 0.0, 1.0))),
-                    ),
-                    Transform::from_xyz(pos.x, pos.y, 2.0), // Behind health bars
-                    Explosion {
-                        timer: 0.0,
-                        max_time: EXPLOSION_DURATION,
-                        max_radius: stats.blast_radius,
-                    },
-                ));
+                explosions_to_spawn.push((pos, stats.damage, stats.blast_radius));
             }
-
             to_despawn.push(entity);
         }
     }
-
-    // Calculate final projectile count before consuming vectors
-    let remaining_projectiles = projectiles.iter().count();
-    let despawn_count = to_despawn.len();
-    let spawn_count = submunitions_to_spawn.len();
 
     // Despawn projectiles
     for entity in to_despawn {
@@ -1590,11 +1527,9 @@ fn update_projectiles(
         ));
     }
 
-    // Only end turn when no projectiles remain (but not if we never had any -
-    // commands are deferred so projectile might not exist on spawn frame)
-    let final_count = remaining_projectiles - despawn_count + spawn_count;
-    if final_count == 0 && remaining_projectiles > 0 {
-        // Note: AA missiles are checked separately in check_projectile_phase_end
+    // Spawn explosions
+    for (pos, damage, blast_radius) in explosions_to_spawn {
+        spawn_explosion(&mut commands, pos, damage, blast_radius);
     }
 }
 
@@ -1618,6 +1553,95 @@ fn check_projectile_phase_end(
         game_state.phase = TurnPhase::TurnEnding;
         game_state.turn_end_timer = TURN_END_DELAY;
         game_state.projectiles_seen = false;
+    }
+}
+
+/// Spawns a pending explosion entity that will apply damage and show animation
+fn spawn_explosion(commands: &mut Commands, pos: Vec2, damage: f32, blast_radius: f32) {
+    commands.spawn((
+        Transform::from_xyz(pos.x, pos.y, 2.0),
+        PendingExplosion {
+            damage,
+            blast_radius,
+        },
+    ));
+}
+
+fn process_pending_explosions(
+    mut commands: Commands,
+    mut terrain_data: ResMut<TerrainData>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    pending: Query<(Entity, &Transform, &PendingExplosion)>,
+    mut player_bases: Query<
+        (&Transform, &mut Health),
+        (With<PlayerBase>, Without<PendingExplosion>, Without<AALauncher>),
+    >,
+    mut aa_launchers: Query<
+        (&Transform, &mut Health),
+        (With<AALauncher>, Without<PendingExplosion>, Without<PlayerBase>),
+    >,
+) {
+    for (entity, transform, explosion) in &pending {
+        let pos = transform.translation.truncate();
+
+        if explosion.blast_radius > 0.0 {
+            // Apply terrain damage
+            terrain_data.apply_damage(pos.x, pos.y, explosion.damage, explosion.blast_radius);
+
+            // Apply blast damage to bases
+            for (base_transform, mut health) in &mut player_bases {
+                let base_pos = base_transform.translation.truncate();
+                let half_size = PLAYER_BASE_SIZE / 2.0;
+
+                let nearest_x = pos.x.clamp(base_pos.x - half_size, base_pos.x + half_size);
+                let nearest_y = pos.y.clamp(base_pos.y - half_size, base_pos.y + half_size);
+                let nearest_point = Vec2::new(nearest_x, nearest_y);
+                let distance = pos.distance(nearest_point);
+
+                if distance <= 0.0 {
+                    health.take_damage(explosion.damage);
+                } else if distance < explosion.blast_radius {
+                    let damage_factor = 1.0 - (distance / explosion.blast_radius);
+                    health.take_damage(explosion.damage * damage_factor);
+                }
+            }
+
+            // Apply blast damage to AA launchers
+            for (aa_transform, mut health) in &mut aa_launchers {
+                let aa_pos = aa_transform.translation.truncate();
+                let half_size = Buildable::AALauncher.size() / 2.0;
+
+                let nearest_x = pos.x.clamp(aa_pos.x - half_size, aa_pos.x + half_size);
+                let nearest_y = pos.y.clamp(aa_pos.y - half_size, aa_pos.y + half_size);
+                let nearest_point = Vec2::new(nearest_x, nearest_y);
+                let distance = pos.distance(nearest_point);
+
+                if distance <= 0.0 {
+                    health.take_damage(explosion.damage);
+                } else if distance < explosion.blast_radius {
+                    let damage_factor = 1.0 - (distance / explosion.blast_radius);
+                    health.take_damage(explosion.damage * damage_factor);
+                }
+            }
+
+            // Spawn explosion animation
+            commands.spawn((
+                Mesh2d(meshes.add(Circle::new(1.0))),
+                MeshMaterial2d(
+                    materials.add(ColorMaterial::from_color(Color::srgba(1.0, 0.6, 0.0, 1.0))),
+                ),
+                Transform::from_xyz(pos.x, pos.y, 2.0),
+                Explosion {
+                    timer: 0.0,
+                    max_time: EXPLOSION_DURATION,
+                    max_radius: explosion.blast_radius,
+                },
+            ));
+        }
+
+        // Remove the pending explosion
+        commands.entity(entity).despawn();
     }
 }
 
@@ -1731,8 +1755,8 @@ fn update_aa_missiles(
     mut commands: Commands,
     game_state: Res<GameState>,
     time: Res<Time>,
-    mut missiles: Query<(Entity, &mut Transform, &mut AAMissile, &mut Sprite)>,
-    projectiles: Query<&Transform, (With<Projectile>, Without<AAMissile>)>,
+    mut missiles: Query<(Entity, &mut Transform, &mut AAMissile)>,
+    projectiles: Query<(&Transform, &Projectile), Without<AAMissile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
@@ -1742,15 +1766,19 @@ fn update_aa_missiles(
 
     let dt = time.delta_secs();
 
-    for (entity, mut transform, mut missile, _sprite) in &mut missiles {
-        // Check if target still exists
-        let target_pos = if let Ok(target_transform) = projectiles.get(missile.target) {
-            target_transform.translation.truncate()
-        } else {
-            // Target destroyed, despawn missile
-            commands.entity(entity).despawn();
-            continue;
-        };
+    for (entity, mut transform, mut missile) in &mut missiles {
+        // Check if target still exists and get its data
+        let (target_pos, target_weapon) =
+            if let Ok((target_transform, projectile)) = projectiles.get(missile.target) {
+                (
+                    target_transform.translation.truncate(),
+                    projectile.weapon,
+                )
+            } else {
+                // Target destroyed, despawn missile
+                commands.entity(entity).despawn();
+                continue;
+            };
 
         let pos = transform.translation.truncate();
 
@@ -1821,21 +1849,13 @@ fn update_aa_missiles(
         // Check collision with target
         let distance_to_target = to_target.length();
         if distance_to_target < AA_MISSILE_EXPLOSION_RADIUS {
-            // Hit! Spawn explosion and destroy both missile and projectile
-            commands.spawn((
-                Mesh2d(meshes.add(Circle::new(1.0))),
-                MeshMaterial2d(
-                    materials.add(ColorMaterial::from_color(Color::srgba(0.8, 0.8, 0.2, 1.0))),
-                ),
-                Transform::from_xyz(transform.translation.x, transform.translation.y, 2.0),
-                Explosion {
-                    timer: 0.0,
-                    max_time: EXPLOSION_DURATION,
-                    max_radius: AA_MISSILE_EXPLOSION_RADIUS,
-                },
-            ));
+            // Hit! Trigger the projectile's explosion at the intercept point
+            let stats = target_weapon.stats();
+            if stats.blast_radius > 0.0 {
+                spawn_explosion(&mut commands, target_pos, stats.damage, stats.blast_radius);
+            }
 
-            // Destroy the projectile
+            // Destroy the projectile and missile
             commands.entity(missile.target).despawn();
             commands.entity(entity).despawn();
         }
