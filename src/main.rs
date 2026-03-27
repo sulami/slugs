@@ -1429,8 +1429,8 @@ fn spawn_world(
 fn generate_terrain_heights() -> Vec<f32> {
     let mut rng = rand::rng();
     let mut heights = vec![0.0f32; TERRAIN_SEGMENTS + 1];
-    heights[0] = rng.random_range(200.0..600.0);
-    heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
+    heights[0] = rng.random_range(600.0..900.0);
+    heights[TERRAIN_SEGMENTS] = rng.random_range(600.0..900.0);
     midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
     heights
 }
