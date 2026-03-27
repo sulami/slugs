@@ -50,11 +50,19 @@ fn main() {
                 camera_pan,
                 update_turn_indicator,
                 handle_weapon_selection,
+                handle_debug_win_button,
                 handle_aiming,
                 update_aim_line,
                 update_charge_indicator,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
                 update_projectiles,
                 check_turn_end,
+                update_game_over_overlay,
+                handle_game_over_buttons,
             ),
         )
         .run();
@@ -135,6 +143,7 @@ enum TurnPhase {
     Aiming,
     ProjectileInFlight,
     TurnEnding,
+    GameOver,
 }
 
 #[derive(Resource)]
@@ -143,6 +152,7 @@ struct GameState {
     selected_weapon: Option<Weapon>,
     phase: TurnPhase,
     turn_end_timer: f32,
+    winner: Option<Player>,
 }
 
 impl Default for GameState {
@@ -152,6 +162,7 @@ impl Default for GameState {
             selected_weapon: None,
             phase: TurnPhase::Aiming,
             turn_end_timer: 0.0,
+            winner: None,
         }
     }
 }
@@ -189,6 +200,18 @@ struct ChargeIndicatorWorld;
 struct Projectile {
     velocity: Vec2,
 }
+
+#[derive(Component)]
+struct DebugWinButton;
+
+#[derive(Component)]
+struct GameOverOverlay;
+
+#[derive(Component)]
+struct NewGameButton;
+
+#[derive(Component)]
+struct ExitButton;
 
 fn setup_camera(mut commands: Commands) {
     // Start zoomed out to see the whole world
@@ -255,6 +278,31 @@ fn setup_ui(mut commands: Commands) {
                     },
                     TextColor(Color::WHITE),
                 ));
+
+            // Debug win button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        width: Val::Px(60.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(0.5, 0.5, 0.0)),
+                    BackgroundColor(Color::srgb(0.2, 0.2, 0.1)),
+                    DebugWinButton,
+                ))
+                .with_child((
+                    Text::new("Win"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 1.0, 0.5)),
+                ));
         });
 
     // World-space charge indicator (will be positioned near base during aiming)
@@ -269,6 +317,94 @@ fn setup_ui(mut commands: Commands) {
         Visibility::Hidden,
         ChargeIndicatorWorld,
     ));
+
+    // Game over overlay (hidden by default)
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(30.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+            Visibility::Hidden,
+            GameOverOverlay,
+        ))
+        .with_children(|parent| {
+            // Winner text
+            parent.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: 72.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+
+            // Button container
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(20.0),
+                    ..default()
+                })
+                .with_children(|button_parent| {
+                    // New Game button
+                    button_parent
+                        .spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(150.0),
+                                height: Val::Px(50.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::WHITE),
+                            BackgroundColor(Color::srgb(0.2, 0.5, 0.2)),
+                            NewGameButton,
+                        ))
+                        .with_child((
+                            Text::new("New Game"),
+                            TextFont {
+                                font_size: 20.0,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                        ));
+
+                    // Exit button
+                    button_parent
+                        .spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(150.0),
+                                height: Val::Px(50.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::WHITE),
+                            BackgroundColor(Color::srgb(0.5, 0.2, 0.2)),
+                            ExitButton,
+                        ))
+                        .with_child((
+                            Text::new("Exit"),
+                            TextFont {
+                                font_size: 20.0,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                        ));
+                });
+        });
 }
 
 fn update_turn_indicator(
@@ -303,6 +439,18 @@ fn handle_weapon_selection(
             *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
         } else {
             *border_color = BorderColor::all(Color::WHITE);
+        }
+    }
+}
+
+fn handle_debug_win_button(
+    mut game_state: ResMut<GameState>,
+    interaction_query: Query<&Interaction, (Changed<Interaction>, With<DebugWinButton>)>,
+) {
+    for interaction in &interaction_query {
+        if *interaction == Interaction::Pressed {
+            game_state.winner = Some(game_state.current_player);
+            game_state.phase = TurnPhase::GameOver;
         }
     }
 }
@@ -571,6 +719,7 @@ fn update_projectiles(
     terrain_data: Res<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
+    player_bases: Query<(&Transform, &PlayerBase), Without<Projectile>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -597,6 +746,24 @@ fn update_projectiles(
             continue;
         }
 
+        // Check base collision
+        for (base_transform, player_base) in &player_bases {
+            let base_pos = base_transform.translation.truncate();
+            let half_size = PLAYER_BASE_SIZE / 2.0;
+
+            if pos.x >= base_pos.x - half_size
+                && pos.x <= base_pos.x + half_size
+                && pos.y >= base_pos.y - half_size
+                && pos.y <= base_pos.y + half_size
+            {
+                // Hit a base - that player loses, the other wins
+                commands.entity(entity).despawn();
+                game_state.winner = Some(player_base.player.next());
+                game_state.phase = TurnPhase::GameOver;
+                return;
+            }
+        }
+
         // Check terrain collision
         if let Some(terrain_height) = terrain_data.get_height_at(pos.x) {
             if pos.y <= terrain_height {
@@ -620,6 +787,155 @@ fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
         game_state.current_player = game_state.current_player.next();
         game_state.selected_weapon = None;
         game_state.phase = TurnPhase::Aiming;
+    }
+}
+
+fn update_game_over_overlay(
+    game_state: Res<GameState>,
+    mut overlay_query: Query<(&mut Visibility, &Children), With<GameOverOverlay>>,
+    mut text_query: Query<(&mut Text, &mut TextColor)>,
+) {
+    let Ok((mut visibility, children)) = overlay_query.single_mut() else {
+        return;
+    };
+
+    if game_state.phase == TurnPhase::GameOver {
+        *visibility = Visibility::Visible;
+
+        // Update winner text
+        if let Some(winner) = game_state.winner {
+            // The first child should be the winner text
+            if let Some(first_child) = children.iter().next() {
+                if let Ok((mut text, mut color)) = text_query.get_mut(first_child) {
+                    **text = format!("{} Wins!", winner.name());
+                    *color = TextColor(winner.color());
+                }
+            }
+        }
+    } else {
+        *visibility = Visibility::Hidden;
+    }
+}
+
+fn handle_game_over_buttons(
+    new_game_query: Query<&Interaction, (Changed<Interaction>, With<NewGameButton>)>,
+    exit_query: Query<&Interaction, (Changed<Interaction>, With<ExitButton>)>,
+    mut app_exit: MessageWriter<AppExit>,
+    mut game_state: ResMut<GameState>,
+    mut terrain_data: ResMut<TerrainData>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    terrain_query: Query<Entity, With<Terrain>>,
+    base_query: Query<Entity, With<PlayerBase>>,
+    projectile_query: Query<Entity, With<Projectile>>,
+) {
+    // Handle exit button
+    for interaction in &exit_query {
+        if *interaction == Interaction::Pressed {
+            app_exit.write(AppExit::Success);
+        }
+    }
+
+    // Handle new game button
+    for interaction in &new_game_query {
+        if *interaction == Interaction::Pressed {
+            // Reset game state
+            *game_state = GameState::default();
+
+            // Despawn old entities
+            for entity in terrain_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in base_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in projectile_query.iter() {
+                commands.entity(entity).despawn();
+            }
+
+            // Generate new terrain (inline the logic here)
+            let mut rng = rand::rng();
+
+            let mut heights = vec![0.0f32; TERRAIN_SEGMENTS + 1];
+            heights[0] = rng.random_range(200.0..600.0);
+            heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
+
+            midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
+
+            terrain_data.heights = heights.clone();
+
+            let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
+            let half_width = WORLD_WIDTH / 2.0;
+            let half_height = WORLD_HEIGHT / 2.0;
+
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
+
+            for i in 0..TERRAIN_SEGMENTS {
+                let x0 = i as f32 * segment_width - half_width;
+                let x1 = (i + 1) as f32 * segment_width - half_width;
+                let y0 = heights[i] - half_height;
+                let y1 = heights[i + 1] - half_height;
+                let bottom = -half_height;
+
+                let base = vertices.len() as u32;
+                vertices.push([x0, bottom, 0.0]);
+                vertices.push([x1, bottom, 0.0]);
+                vertices.push([x1, y1, 0.0]);
+                vertices.push([x0, y0, 0.0]);
+
+                indices.push(base);
+                indices.push(base + 1);
+                indices.push(base + 2);
+                indices.push(base);
+                indices.push(base + 2);
+                indices.push(base + 3);
+            }
+
+            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+            mesh.insert_indices(Indices::U32(indices));
+
+            commands.spawn((
+                Mesh2d(meshes.add(mesh)),
+                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2)))),
+                Terrain,
+            ));
+
+            // Spawn player bases
+            let blue_segment = TERRAIN_SEGMENTS * 15 / 100;
+            let blue_x = blue_segment as f32 * segment_width - half_width;
+            let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+
+            commands.spawn((
+                Sprite {
+                    color: Player::Blue.color(),
+                    custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                    ..default()
+                },
+                Transform::from_xyz(blue_x, blue_y, 1.0),
+                PlayerBase {
+                    player: Player::Blue,
+                },
+            ));
+
+            let red_segment = TERRAIN_SEGMENTS * 85 / 100;
+            let red_x = red_segment as f32 * segment_width - half_width;
+            let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+
+            commands.spawn((
+                Sprite {
+                    color: Player::Red.color(),
+                    custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                    ..default()
+                },
+                Transform::from_xyz(red_x, red_y, 1.0),
+                PlayerBase {
+                    player: Player::Red,
+                },
+            ));
+        }
     }
 }
 
