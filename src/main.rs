@@ -1926,7 +1926,7 @@ fn update_projectiles(
             let base_velocity = projectile.velocity;
             let color = sprite.color;
 
-            for i in 0..5 {
+            for i in 0..8 {
                 // Spread angle: -10 to +10 degrees from current direction
                 let angle_offset = ((i as f32 - 2.0) / 2.0) * 0.18; // ~10 degrees
                 let random_offset = rng.random_range(-0.05..0.05);
