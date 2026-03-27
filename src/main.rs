@@ -1057,8 +1057,8 @@ fn handle_building(
     mouse_button: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
     camera_query: Query<&Transform, With<MainCamera>>,
-    terrain_data: Res<TerrainData>,
     interaction_query: Query<&Interaction, With<Button>>,
+    terrain_data: Res<TerrainData>,
     mut preview_query: Query<
         (&mut Transform, &mut Visibility, &mut Sprite),
         (
@@ -1069,6 +1069,7 @@ fn handle_building(
         ),
     >,
     build_extenders: Query<(&Transform, &ExtendsBuildArea), Without<BuildPreview>>,
+    structures: Query<(&Transform, &Sprite), (With<FallsWithGravity>, Without<BuildPreview>)>,
 ) {
     let Ok((mut preview_transform, mut preview_visibility, mut preview_sprite)) =
         preview_query.single_mut()
@@ -1104,11 +1105,12 @@ fn handle_building(
     let cursor_world =
         camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
 
-    // Snap to terrain height
-    let terrain_y = terrain_data
-        .get_height_at(cursor_world.x)
-        .unwrap_or(cursor_world.y);
-    let placement_pos = Vec2::new(cursor_world.x, terrain_y + buildable.size() / 2.0);
+    // Free placement at cursor position - gravity will handle falling
+    let placement_pos = cursor_world;
+    let preview_size = match buildable {
+        Buildable::Wall => Vec2::new(buildable.size(), buildable.size() * 1.5),
+        _ => Vec2::splat(buildable.size()),
+    };
 
     // Collect friendly structure positions for build radius check
     let friendly_positions: Vec<Vec2> = build_extenders
@@ -1118,15 +1120,31 @@ fn handle_building(
         .collect();
 
     // Check if placement is within build radius of any friendly structure
-    let is_valid_placement = friendly_positions
+    let in_build_radius = friendly_positions
         .iter()
         .any(|pos| pos.distance(placement_pos) <= BUILD_RADIUS);
 
+    // Check for overlap with existing structures
+    let overlaps_structure = structures.iter().any(|(t, s)| {
+        let struct_pos = t.translation.truncate();
+        let struct_size = s.custom_size.unwrap_or(Vec2::splat(30.0));
+
+        // AABB collision check
+        let half_preview = preview_size / 2.0;
+        let half_struct = struct_size / 2.0;
+
+        (placement_pos.x - struct_pos.x).abs() < (half_preview.x + half_struct.x)
+            && (placement_pos.y - struct_pos.y).abs() < (half_preview.y + half_struct.y)
+    });
+
+    // Check if placement is in the ground
+    let terrain_height = terrain_data.get_height_at(placement_pos.x).unwrap_or(0.0);
+    let bottom_of_preview = placement_pos.y - preview_size.y / 2.0;
+    let in_ground = bottom_of_preview < terrain_height;
+
+    let is_valid_placement = in_build_radius && !overlaps_structure && !in_ground;
+
     // Update preview
-    let preview_size = match buildable {
-        Buildable::Wall => Vec2::new(buildable.size(), buildable.size() * 1.5),
-        _ => Vec2::splat(buildable.size()),
-    };
     preview_transform.translation.x = placement_pos.x;
     preview_transform.translation.y = placement_pos.y;
     preview_sprite.custom_size = Some(preview_size);
@@ -2021,30 +2039,65 @@ fn rebuild_terrain_mesh(
 
 fn update_falling_entities(
     terrain_data: Res<TerrainData>,
-    mut entities: Query<(&mut Transform, &FallsWithGravity)>,
+    mut entities: Query<(Entity, &mut Transform, &FallsWithGravity, &Sprite)>,
     time: Res<Time>,
 ) {
-    for (mut transform, falls) in &mut entities {
+    // Collect all entity positions and sizes first (for collision checking)
+    let entity_data: Vec<(Entity, Vec2, Vec2)> = entities
+        .iter()
+        .map(|(e, t, _, s)| {
+            let size = s.custom_size.unwrap_or(Vec2::splat(30.0));
+            (e, t.translation.truncate(), size)
+        })
+        .collect();
+
+    for (entity, mut transform, falls, sprite) in &mut entities {
         let x = transform.translation.x;
         let bottom = transform.translation.y - falls.size / 2.0;
+        let width = sprite.custom_size.map(|s| s.x).unwrap_or(30.0);
 
         // Get terrain height at entity position
-        if let Some(terrain_height) = terrain_data.get_height_at(x) {
-            // If entity is above terrain, make it fall
-            if bottom > terrain_height + 1.0 {
-                // Apply gravity
-                let fall_speed = GRAVITY * time.delta_secs();
-                transform.translation.y -= fall_speed;
+        let terrain_height = terrain_data.get_height_at(x).unwrap_or(0.0);
 
-                // Don't fall below terrain
-                let min_y = terrain_height + falls.size / 2.0;
-                if transform.translation.y < min_y {
-                    transform.translation.y = min_y;
-                }
-            } else {
-                // Snap to terrain if close
-                transform.translation.y = terrain_height + falls.size / 2.0;
+        // Find the highest surface below this entity (terrain or another structure)
+        let mut rest_height = terrain_height;
+
+        for (other_entity, other_pos, other_size) in &entity_data {
+            // Skip self
+            if *other_entity == entity {
+                continue;
             }
+
+            // Check horizontal overlap
+            let half_width = width / 2.0;
+            let other_half_width = other_size.x / 2.0;
+            let horizontal_overlap = (x - other_pos.x).abs() < (half_width + other_half_width - 5.0);
+
+            if horizontal_overlap {
+                // Top of the other entity
+                let other_top = other_pos.y + other_size.y / 2.0;
+
+                // Only consider structures that are below us
+                if other_top < transform.translation.y && other_top > rest_height {
+                    rest_height = other_top;
+                }
+            }
+        }
+
+        // If entity is above rest height, make it fall
+        if bottom > rest_height + 1.0 {
+            // Apply gravity
+            let fall_speed = GRAVITY * time.delta_secs();
+            transform.translation.y -= fall_speed;
+
+            // Don't fall below rest height
+            let min_y = rest_height + falls.size / 2.0;
+            if transform.translation.y < min_y {
+                transform.translation.y = min_y;
+            }
+        } else {
+            // Snap to rest height if close
+            transform.translation.y = rest_height + falls.size / 2.0;
         }
     }
 }
