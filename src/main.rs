@@ -62,6 +62,7 @@ fn main() {
             (
                 update_projectiles,
                 rebuild_terrain_mesh,
+                update_falling_bases,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -983,6 +984,36 @@ fn rebuild_terrain_mesh(
 
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
     mesh.insert_indices(Indices::U32(indices));
+}
+
+fn update_falling_bases(
+    terrain_data: Res<TerrainData>,
+    mut bases: Query<&mut Transform, With<PlayerBase>>,
+    time: Res<Time>,
+) {
+    for mut transform in &mut bases {
+        let base_x = transform.translation.x;
+        let base_bottom = transform.translation.y - PLAYER_BASE_SIZE / 2.0;
+
+        // Get terrain height at base position
+        if let Some(terrain_height) = terrain_data.get_height_at(base_x) {
+            // If base is above terrain, make it fall
+            if base_bottom > terrain_height + 1.0 {
+                // Apply gravity
+                let fall_speed = GRAVITY * time.delta_secs();
+                transform.translation.y -= fall_speed;
+
+                // Don't fall below terrain
+                let min_y = terrain_height + PLAYER_BASE_SIZE / 2.0;
+                if transform.translation.y < min_y {
+                    transform.translation.y = min_y;
+                }
+            } else {
+                // Snap to terrain if close
+                transform.translation.y = terrain_height + PLAYER_BASE_SIZE / 2.0;
+            }
+        }
+    }
 }
 
 fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
