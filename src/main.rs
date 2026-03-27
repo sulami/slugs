@@ -762,34 +762,44 @@ fn handle_weapon_selection(
         &mut BackgroundColor,
     )>,
 ) {
-    // Handle clicks - toggle selection
-    for (interaction, weapon_button) in &interaction_query {
-        if *interaction == Interaction::Pressed {
-            if game_state.selected_weapon == Some(weapon_button.weapon) {
-                game_state.selected_weapon = None;
-            } else {
-                game_state.selected_weapon = Some(weapon_button.weapon);
-                game_state.selected_buildable = None; // Deselect buildable
+    let is_disabled = game_state.phase != TurnPhase::Aiming;
+
+    // Handle clicks - toggle selection (only when enabled)
+    if !is_disabled {
+        for (interaction, weapon_button) in &interaction_query {
+            if *interaction == Interaction::Pressed {
+                if game_state.selected_weapon == Some(weapon_button.weapon) {
+                    game_state.selected_weapon = None;
+                } else {
+                    game_state.selected_weapon = Some(weapon_button.weapon);
+                    game_state.selected_buildable = None; // Deselect buildable
+                }
             }
         }
     }
 
     // Update button visuals
     for (interaction, weapon_button, mut border_color, mut bg_color) in &mut button_query {
-        let is_selected = game_state.selected_weapon == Some(weapon_button.weapon);
-        let is_hovered = *interaction == Interaction::Hovered;
-
-        // Border: yellow if selected, white otherwise
-        if is_selected {
-            *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+        if is_disabled {
+            // Grayed out when disabled
+            *border_color = BorderColor::all(Color::srgb(0.4, 0.4, 0.4));
+            *bg_color = BackgroundColor(Color::srgb(0.2, 0.2, 0.2));
         } else {
-            *border_color = BorderColor::all(Color::WHITE);
-        }
+            let is_selected = game_state.selected_weapon == Some(weapon_button.weapon);
+            let is_hovered = *interaction == Interaction::Hovered;
 
-        // Background: combine selected and hovered states
-        let base = if is_selected { 0.4 } else { 0.3 };
-        let brightness = if is_hovered { base + 0.15 } else { base };
-        *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
+            // Border: yellow if selected, white otherwise
+            if is_selected {
+                *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+            } else {
+                *border_color = BorderColor::all(Color::WHITE);
+            }
+
+            // Background: combine selected and hovered states
+            let base = if is_selected { 0.4 } else { 0.3 };
+            let brightness = if is_hovered { base + 0.15 } else { base };
+            *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
+        }
     }
 }
 
@@ -803,39 +813,50 @@ fn handle_buildable_selection(
         &mut BackgroundColor,
     )>,
 ) {
-    // Handle clicks - toggle selection
-    for (interaction, buildable_button) in &interaction_query {
-        if *interaction == Interaction::Pressed {
-            if game_state.selected_buildable == Some(buildable_button.buildable) {
-                game_state.selected_buildable = None;
-            } else {
-                game_state.selected_buildable = Some(buildable_button.buildable);
-                game_state.selected_weapon = None; // Deselect weapon
+    let is_disabled = game_state.phase != TurnPhase::Aiming;
+
+    // Handle clicks - toggle selection (only when enabled)
+    if !is_disabled {
+        for (interaction, buildable_button) in &interaction_query {
+            if *interaction == Interaction::Pressed {
+                if game_state.selected_buildable == Some(buildable_button.buildable) {
+                    game_state.selected_buildable = None;
+                } else {
+                    game_state.selected_buildable = Some(buildable_button.buildable);
+                    game_state.selected_weapon = None; // Deselect weapon
+                }
             }
         }
     }
 
     // Update button visuals
     for (interaction, buildable_button, mut border_color, mut bg_color) in &mut button_query {
-        let is_selected = game_state.selected_buildable == Some(buildable_button.buildable);
-        let is_hovered = *interaction == Interaction::Hovered;
-
-        // Border: yellow if selected, white otherwise
-        if is_selected {
-            *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+        if is_disabled {
+            // Grayed out when disabled
+            *border_color = BorderColor::all(Color::srgb(0.4, 0.4, 0.4));
+            *bg_color = BackgroundColor(Color::srgb(0.2, 0.2, 0.2));
         } else {
-            *border_color = BorderColor::all(Color::WHITE);
-        }
+            let is_selected = game_state.selected_buildable == Some(buildable_button.buildable);
+            let is_hovered = *interaction == Interaction::Hovered;
 
-        // Background: combine selected and hovered states
-        let base = if is_selected { 0.4 } else { 0.3 };
-        let brightness = if is_hovered { base + 0.15 } else { base };
-        *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
+            // Border: yellow if selected, white otherwise
+            if is_selected {
+                *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+            } else {
+                *border_color = BorderColor::all(Color::WHITE);
+            }
+
+            // Background: combine selected and hovered states
+            let base = if is_selected { 0.4 } else { 0.3 };
+            let brightness = if is_hovered { base + 0.15 } else { base };
+            *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
+        }
     }
 }
 
 fn update_weapon_tooltip(
     weapon_buttons: Query<(&Interaction, &WeaponButton)>,
+    buildable_buttons: Query<(&Interaction, &BuildableButton)>,
     mut tooltip_query: Query<(&mut Node, &Children), With<WeaponTooltip>>,
     mut text_query: Query<&mut Text>,
     windows: Query<&Window>,
@@ -845,32 +866,51 @@ fn update_weapon_tooltip(
     };
 
     // Find hovered weapon button
-    let hovered = weapon_buttons
+    let hovered_weapon = weapon_buttons
         .iter()
         .find(|(interaction, _)| **interaction == Interaction::Hovered);
 
-    if let Some((_, weapon_button)) = hovered {
+    // Find hovered buildable button
+    let hovered_buildable = buildable_buttons
+        .iter()
+        .find(|(interaction, _)| **interaction == Interaction::Hovered);
+
+    let tooltip_text = if let Some((_, weapon_button)) = hovered_weapon {
+        // Special handling for cluster grenade - show submunition stats
+        if weapon_button.weapon == Weapon::ClusterGrenade {
+            let sub_stats = Weapon::ClusterSubmunition.stats();
+            Some(format!(
+                "{}\n5x Submunitions\nDamage: {} each\nBlast Radius: {}",
+                weapon_button.weapon.name(),
+                sub_stats.damage,
+                sub_stats.blast_radius
+            ))
+        } else {
+            let stats = weapon_button.weapon.stats();
+            Some(format!(
+                "{}\nDamage: {}\nBlast Radius: {}",
+                weapon_button.weapon.name(),
+                stats.damage,
+                stats.blast_radius
+            ))
+        }
+    } else if let Some((_, buildable_button)) = hovered_buildable {
+        match buildable_button.buildable {
+            Buildable::AALauncher => Some(format!(
+                "AA Launcher\nHealth: {}\nDetection Range: {}\nFires tracking missiles at\nenemy projectiles (1/turn)",
+                Buildable::AALauncher.health() as i32,
+                AA_DETECTION_RANGE as i32
+            )),
+        }
+    } else {
+        None
+    };
+
+    if let Some(text_content) = tooltip_text {
         // Update text in child
         if let Some(child) = children.iter().next() {
             if let Ok(mut text) = text_query.get_mut(child) {
-                // Special handling for cluster grenade - show submunition stats
-                if weapon_button.weapon == Weapon::ClusterGrenade {
-                    let sub_stats = Weapon::ClusterSubmunition.stats();
-                    **text = format!(
-                        "{}\n5x Submunitions\nDamage: {} each\nBlast Radius: {}",
-                        weapon_button.weapon.name(),
-                        sub_stats.damage,
-                        sub_stats.blast_radius
-                    );
-                } else {
-                    let stats = weapon_button.weapon.stats();
-                    **text = format!(
-                        "{}\nDamage: {}\nBlast Radius: {}",
-                        weapon_button.weapon.name(),
-                        stats.damage,
-                        stats.blast_radius
-                    );
-                }
+                **text = text_content;
             }
         }
 
