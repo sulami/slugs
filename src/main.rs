@@ -1275,29 +1275,14 @@ fn draw_buildable_area(
         .map(|(t, _)| t.translation.truncate())
         .collect();
 
-    // Draw filled circles for each friendly structure's build radius
-    // Using multiple concentric circles to create a filled effect
+    // Draw subtle outer ring for each friendly structure's build radius
     let player_color = game_state.current_player.color().to_srgba();
-    let fill_color = Color::srgba(
-        player_color.red,
-        player_color.green,
-        player_color.blue,
-        0.15,
-    );
 
     for pos in &friendly_positions {
-        // Draw filled area using concentric circles
-        let num_rings = 20;
-        for i in 0..num_rings {
-            let radius = BUILD_RADIUS * (i as f32 + 1.0) / num_rings as f32;
-            gizmos.circle_2d(*pos, radius, fill_color);
-        }
-
-        // Draw outer edge
         gizmos.circle_2d(
             *pos,
             BUILD_RADIUS,
-            Color::srgba(player_color.red, player_color.green, player_color.blue, 0.5),
+            Color::srgba(player_color.red, player_color.green, player_color.blue, 0.3),
         );
     }
 }
