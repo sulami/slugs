@@ -17,6 +17,7 @@ const ZOOM_SPEED: f32 = 0.1;
 
 // Player settings
 const PLAYER_BASE_SIZE: f32 = 40.0;
+const PLAYER_BASE_HEALTH: f32 = 10.0;
 
 // Projectile settings
 const GRAVITY: f32 = 400.0;
@@ -63,6 +64,8 @@ fn main() {
                 update_projectiles,
                 rebuild_terrain_mesh,
                 update_falling_bases,
+                update_health_bars,
+                check_base_destruction,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -264,6 +267,31 @@ struct Terrain;
 #[derive(Component)]
 struct PlayerBase {
     player: Player,
+}
+
+#[derive(Component)]
+struct Health {
+    current: f32,
+    max: f32,
+}
+
+impl Health {
+    fn new(max: f32) -> Self {
+        Self { current: max, max }
+    }
+
+    fn take_damage(&mut self, amount: f32) {
+        self.current = (self.current - amount).max(0.0);
+    }
+
+    fn is_dead(&self) -> bool {
+        self.current <= 0.0
+    }
+}
+
+#[derive(Component)]
+struct HealthBar {
+    owner: Entity,
 }
 
 #[derive(Component)]
@@ -874,7 +902,7 @@ fn update_projectiles(
     mut terrain_data: ResMut<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
-    player_bases: Query<(&Transform, &PlayerBase), Without<Projectile>>,
+    mut player_bases: Query<(Entity, &Transform, &PlayerBase, &mut Health), Without<Projectile>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -901,8 +929,9 @@ fn update_projectiles(
             continue;
         }
 
-        // Check base collision
-        for (base_transform, player_base) in &player_bases {
+        // Check direct base collision (projectile hits base directly)
+        let mut hit_base_directly = false;
+        for (_, base_transform, _, _) in &player_bases {
             let base_pos = base_transform.translation.truncate();
             let half_size = PLAYER_BASE_SIZE / 2.0;
 
@@ -911,25 +940,45 @@ fn update_projectiles(
                 && pos.y >= base_pos.y - half_size
                 && pos.y <= base_pos.y + half_size
             {
-                // Hit a base - that player loses, the other wins
-                commands.entity(entity).despawn();
-                game_state.winner = Some(player_base.player.next());
-                game_state.phase = TurnPhase::GameOver;
-                return;
+                hit_base_directly = true;
+                break;
             }
         }
 
         // Check terrain collision
-        if let Some(terrain_height) = terrain_data.get_height_at(pos.x) {
-            if pos.y <= terrain_height {
-                // Hit terrain - apply damage
-                let stats = projectile.weapon.stats();
-                terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
+        let terrain_hit = terrain_data
+            .get_height_at(pos.x)
+            .map(|h| pos.y <= h)
+            .unwrap_or(false);
 
-                commands.entity(entity).despawn();
-                game_state.phase = TurnPhase::TurnEnding;
-                game_state.turn_end_timer = TURN_END_DELAY;
+        if hit_base_directly || terrain_hit {
+            // Apply blast damage to terrain
+            let stats = projectile.weapon.stats();
+            terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
+
+            // Apply blast damage to all bases within blast radius
+            for (_, base_transform, _, mut health) in &mut player_bases {
+                let base_pos = base_transform.translation.truncate();
+                let distance = pos.distance(base_pos);
+
+                // Direct hit if impact touches the base (within half the base size)
+                let direct_hit_radius = PLAYER_BASE_SIZE / 2.0;
+                if distance <= direct_hit_radius {
+                    // Full damage for direct hit
+                    health.take_damage(stats.damage);
+                } else if distance < stats.blast_radius {
+                    // Damage falls off linearly with distance from edge of base
+                    let effective_distance = distance - direct_hit_radius;
+                    let effective_radius = stats.blast_radius - direct_hit_radius;
+                    let damage_factor = 1.0 - (effective_distance / effective_radius);
+                    let damage = stats.damage * damage_factor;
+                    health.take_damage(damage);
+                }
             }
+
+            commands.entity(entity).despawn();
+            game_state.phase = TurnPhase::TurnEnding;
+            game_state.turn_end_timer = TURN_END_DELAY;
         }
     }
 }
@@ -1016,6 +1065,42 @@ fn update_falling_bases(
     }
 }
 
+fn update_health_bars(
+    bases: Query<(Entity, &Transform, &Health), With<PlayerBase>>,
+    mut health_bars: Query<(&mut Text2d, &mut Transform, &HealthBar), Without<PlayerBase>>,
+) {
+    for (mut text, mut bar_transform, health_bar) in &mut health_bars {
+        // Find the owner base
+        if let Some((_, base_transform, health)) =
+            bases.iter().find(|(e, _, _)| *e == health_bar.owner)
+        {
+            // Update text
+            **text = format!("{}", health.current.ceil() as i32);
+
+            // Position below the base
+            bar_transform.translation.x = base_transform.translation.x;
+            bar_transform.translation.y =
+                base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
+        }
+    }
+}
+
+fn check_base_destruction(mut game_state: ResMut<GameState>, bases: Query<(&PlayerBase, &Health)>) {
+    // Only check during turn ending phase to avoid premature game over
+    if game_state.phase != TurnPhase::TurnEnding {
+        return;
+    }
+
+    for (player_base, health) in &bases {
+        if health.is_dead() {
+            // This player's base was destroyed, the other player wins
+            game_state.winner = Some(player_base.player.next());
+            game_state.phase = TurnPhase::GameOver;
+            return;
+        }
+    }
+}
+
 fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
     if game_state.phase != TurnPhase::TurnEnding {
         return;
@@ -1069,6 +1154,7 @@ fn handle_game_over_buttons(
     terrain_query: Query<Entity, With<Terrain>>,
     base_query: Query<Entity, With<PlayerBase>>,
     projectile_query: Query<Entity, With<Projectile>>,
+    health_bar_query: Query<Entity, With<HealthBar>>,
 ) {
     // Handle exit button
     for interaction in &exit_query {
@@ -1091,6 +1177,9 @@ fn handle_game_over_buttons(
                 commands.entity(entity).despawn();
             }
             for entity in projectile_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in health_bar_query.iter() {
                 commands.entity(entity).despawn();
             }
 
@@ -1150,32 +1239,62 @@ fn handle_game_over_buttons(
             let blue_x = blue_segment as f32 * segment_width - half_width;
             let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
 
+            let blue_base = commands
+                .spawn((
+                    Sprite {
+                        color: Player::Blue.color(),
+                        custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                        ..default()
+                    },
+                    Transform::from_xyz(blue_x, blue_y, 1.0),
+                    PlayerBase {
+                        player: Player::Blue,
+                    },
+                    Health::new(PLAYER_BASE_HEALTH),
+                ))
+                .id();
+
+            // Blue health bar
             commands.spawn((
-                Sprite {
-                    color: Player::Blue.color(),
-                    custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
+                TextFont {
+                    font_size: 48.0,
                     ..default()
                 },
-                Transform::from_xyz(blue_x, blue_y, 1.0),
-                PlayerBase {
-                    player: Player::Blue,
-                },
+                TextColor(Player::Blue.color()),
+                Transform::from_xyz(blue_x, blue_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+                HealthBar { owner: blue_base },
             ));
 
             let red_segment = TERRAIN_SEGMENTS * 85 / 100;
             let red_x = red_segment as f32 * segment_width - half_width;
             let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
 
+            let red_base = commands
+                .spawn((
+                    Sprite {
+                        color: Player::Red.color(),
+                        custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                        ..default()
+                    },
+                    Transform::from_xyz(red_x, red_y, 1.0),
+                    PlayerBase {
+                        player: Player::Red,
+                    },
+                    Health::new(PLAYER_BASE_HEALTH),
+                ))
+                .id();
+
+            // Red health bar
             commands.spawn((
-                Sprite {
-                    color: Player::Red.color(),
-                    custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
+                TextFont {
+                    font_size: 48.0,
                     ..default()
                 },
-                Transform::from_xyz(red_x, red_y, 1.0),
-                PlayerBase {
-                    player: Player::Red,
-                },
+                TextColor(Player::Red.color()),
+                Transform::from_xyz(red_x, red_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+                HealthBar { owner: red_base },
             ));
         }
     }
@@ -1247,16 +1366,31 @@ fn generate_terrain(
     let blue_x = blue_segment as f32 * segment_width - half_width;
     let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
 
+    let blue_base = commands
+        .spawn((
+            Sprite {
+                color: Player::Blue.color(),
+                custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                ..default()
+            },
+            Transform::from_xyz(blue_x, blue_y, 1.0),
+            PlayerBase {
+                player: Player::Blue,
+            },
+            Health::new(PLAYER_BASE_HEALTH),
+        ))
+        .id();
+
+    // Blue health bar
     commands.spawn((
-        Sprite {
-            color: Player::Blue.color(),
-            custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+        Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
+        TextFont {
+            font_size: 48.0,
             ..default()
         },
-        Transform::from_xyz(blue_x, blue_y, 1.0),
-        PlayerBase {
-            player: Player::Blue,
-        },
+        TextColor(Player::Blue.color()),
+        Transform::from_xyz(blue_x, blue_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+        HealthBar { owner: blue_base },
     ));
 
     // Red player on the right (around 85% from left edge)
@@ -1264,16 +1398,31 @@ fn generate_terrain(
     let red_x = red_segment as f32 * segment_width - half_width;
     let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
 
+    let red_base = commands
+        .spawn((
+            Sprite {
+                color: Player::Red.color(),
+                custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                ..default()
+            },
+            Transform::from_xyz(red_x, red_y, 1.0),
+            PlayerBase {
+                player: Player::Red,
+            },
+            Health::new(PLAYER_BASE_HEALTH),
+        ))
+        .id();
+
+    // Red health bar
     commands.spawn((
-        Sprite {
-            color: Player::Red.color(),
-            custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+        Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
+        TextFont {
+            font_size: 48.0,
             ..default()
         },
-        Transform::from_xyz(red_x, red_y, 1.0),
-        PlayerBase {
-            player: Player::Red,
-        },
+        TextColor(Player::Red.color()),
+        Transform::from_xyz(red_x, red_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+        HealthBar { owner: red_base },
     ));
 }
 
