@@ -3469,6 +3469,15 @@ fn handle_game_over_buttons(
     health_bar_query: Query<Entity, With<HealthBar>>,
     health_bar_bg_query: Query<Entity, With<HealthBarBackground>>,
     explosion_query: Query<Entity, With<Explosion>>,
+    buildings_query: Query<
+        Entity,
+        Or<(
+            With<AALauncher>,
+            With<Wall>,
+            With<ShieldGenerator>,
+            With<ShieldDome>,
+        )>,
+    >,
 ) {
     // Handle exit button (not on web)
     #[cfg(not(target_arch = "wasm32"))]
@@ -3501,6 +3510,9 @@ fn handle_game_over_buttons(
                 commands.entity(entity).despawn();
             }
             for entity in explosion_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in buildings_query.iter() {
                 commands.entity(entity).despawn();
             }
 
