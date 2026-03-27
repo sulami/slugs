@@ -562,22 +562,35 @@ fn update_turn_indicator(
 fn handle_weapon_selection(
     mut game_state: ResMut<GameState>,
     interaction_query: Query<(&Interaction, &WeaponButton), Changed<Interaction>>,
-    mut button_query: Query<(&WeaponButton, &mut BorderColor)>,
+    mut button_query: Query<(&Interaction, &WeaponButton, &mut BorderColor, &mut BackgroundColor)>,
 ) {
-    // Handle clicks
+    // Handle clicks - toggle selection
     for (interaction, weapon_button) in &interaction_query {
         if *interaction == Interaction::Pressed {
-            game_state.selected_weapon = Some(weapon_button.weapon);
+            if game_state.selected_weapon == Some(weapon_button.weapon) {
+                game_state.selected_weapon = None;
+            } else {
+                game_state.selected_weapon = Some(weapon_button.weapon);
+            }
         }
     }
 
     // Update button visuals
-    for (weapon_button, mut border_color) in &mut button_query {
-        if game_state.selected_weapon == Some(weapon_button.weapon) {
+    for (interaction, weapon_button, mut border_color, mut bg_color) in &mut button_query {
+        let is_selected = game_state.selected_weapon == Some(weapon_button.weapon);
+        let is_hovered = *interaction == Interaction::Hovered;
+
+        // Border: yellow if selected, white otherwise
+        if is_selected {
             *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
         } else {
             *border_color = BorderColor::all(Color::WHITE);
         }
+
+        // Background: combine selected and hovered states
+        let base = if is_selected { 0.4 } else { 0.3 };
+        let brightness = if is_hovered { base + 0.15 } else { base };
+        *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
     }
 }
 
