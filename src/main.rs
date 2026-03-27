@@ -68,7 +68,6 @@ fn main() {
                 handle_weapon_selection,
                 handle_buildable_selection,
                 update_weapon_tooltip,
-                handle_debug_win_button,
                 handle_aiming,
                 handle_building,
                 draw_buildable_area,
@@ -427,9 +426,6 @@ struct HealthBarBackground {
 const EXPLOSION_DURATION: f32 = 0.4;
 
 #[derive(Component)]
-struct DebugWinButton;
-
-#[derive(Component)]
 struct GameOverOverlay;
 
 #[derive(Component)]
@@ -564,30 +560,6 @@ fn setup_ui(mut commands: Commands) {
                     TextColor(Color::WHITE),
                 ));
 
-            // Debug win button
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        width: Val::Px(60.0),
-                        height: Val::Px(40.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(Val::Px(2.0)),
-                        ..default()
-                    },
-                    BorderColor::all(Color::srgb(0.5, 0.5, 0.0)),
-                    BackgroundColor(Color::srgb(0.2, 0.2, 0.1)),
-                    DebugWinButton,
-                ))
-                .with_child((
-                    Text::new("Win"),
-                    TextFont {
-                        font_size: 16.0,
-                        ..default()
-                    },
-                    TextColor(Color::srgb(1.0, 1.0, 0.5)),
-                ));
         });
 
     // Weapon tooltip (hidden by default, positioned near cursor)
@@ -927,18 +899,6 @@ fn update_weapon_tooltip(
         node.display = Display::Flex;
     } else {
         node.display = Display::None;
-    }
-}
-
-fn handle_debug_win_button(
-    mut game_state: ResMut<GameState>,
-    interaction_query: Query<&Interaction, (Changed<Interaction>, With<DebugWinButton>)>,
-) {
-    for interaction in &interaction_query {
-        if *interaction == Interaction::Pressed {
-            game_state.winner = Some(game_state.current_player);
-            game_state.phase = TurnPhase::GameOver;
-        }
     }
 }
 
