@@ -818,6 +818,7 @@ fn handle_aiming(
 
         aiming_state.charging = false;
         aiming_state.charge_time = 0.0;
+        game_state.selected_weapon = None;
         game_state.phase = TurnPhase::ProjectileInFlight;
     }
 }
