@@ -30,6 +30,9 @@ const TURN_END_DELAY: f32 = 1.5;
 const AIM_LINE_LENGTH: f32 = 500.0;
 const TICK_MARK_SIZE: f32 = 15.0;
 
+// Terrain settings
+const GROUND_DAMAGE_RESISTANCE: f32 = 2.0;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -113,12 +116,15 @@ impl TerrainData {
         &mut self,
         impact_world_x: f32,
         impact_world_y: f32,
-        _damage: f32,
+        damage: f32,
         blast_radius: f32,
     ) {
         if self.heights.is_empty() {
             return;
         }
+
+        // Effective crater radius is reduced by ground damage resistance
+        let crater_radius = blast_radius * damage / (damage + GROUND_DAMAGE_RESISTANCE);
 
         let half_width = WORLD_WIDTH / 2.0;
         let half_height = WORLD_HEIGHT / 2.0;
@@ -128,8 +134,8 @@ impl TerrainData {
         let impact_terrain_y = impact_world_y + half_height;
 
         // Calculate which segments are affected by the blast
-        let left_world_x = impact_world_x - blast_radius;
-        let right_world_x = impact_world_x + blast_radius;
+        let left_world_x = impact_world_x - crater_radius;
+        let right_world_x = impact_world_x + crater_radius;
 
         let left_segment = ((left_world_x + half_width) / segment_width)
             .floor()
@@ -139,7 +145,7 @@ impl TerrainData {
             .min(TERRAIN_SEGMENTS as f32) as usize;
 
         // Carve a circular crater - any terrain within the blast circle is destroyed
-        // The crater is centered at the impact point with the given blast_radius
+        // The crater is centered at the impact point with the given crater_radius
         for i in left_segment..=right_segment.min(TERRAIN_SEGMENTS) {
             let segment_world_x = i as f32 * segment_width - half_width;
             let dx = segment_world_x - impact_world_x;
@@ -147,7 +153,7 @@ impl TerrainData {
             // Calculate the crater depth at this x position (circular crater)
             // For a circle: x² + y² = r², so y = sqrt(r² - x²)
             let dx_squared = dx * dx;
-            let radius_squared = blast_radius * blast_radius;
+            let radius_squared = crater_radius * crater_radius;
 
             if dx_squared < radius_squared {
                 // This segment is within the horizontal extent of the blast
@@ -209,7 +215,7 @@ impl Weapon {
         match self {
             Weapon::Artillery => WeaponStats {
                 damage: 10.0,
-                blast_radius: 50.0,
+                blast_radius: 100.0,
             },
         }
     }
