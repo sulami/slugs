@@ -65,6 +65,7 @@ fn main() {
             Update,
             (
                 update_projectiles,
+                update_explosions,
                 rebuild_terrain_mesh,
                 update_falling_bases,
                 update_health_bars,
@@ -316,6 +317,15 @@ struct Projectile {
     velocity: Vec2,
     weapon: Weapon,
 }
+
+#[derive(Component)]
+struct Explosion {
+    timer: f32,
+    max_time: f32,
+    max_radius: f32,
+}
+
+const EXPLOSION_DURATION: f32 = 0.4;
 
 #[derive(Component)]
 struct DebugWinButton;
@@ -919,6 +929,8 @@ fn update_projectiles(
     mut commands: Commands,
     mut game_state: ResMut<GameState>,
     mut terrain_data: ResMut<TerrainData>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
     mut player_bases: Query<(Entity, &Transform, &PlayerBase, &mut Health), Without<Projectile>>,
@@ -995,9 +1007,52 @@ fn update_projectiles(
                 }
             }
 
+            // Spawn explosion
+            commands.spawn((
+                Mesh2d(meshes.add(Circle::new(1.0))),
+                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(1.0, 0.6, 0.0, 1.0)))),
+                Transform::from_xyz(pos.x, pos.y, 2.0),
+                Explosion {
+                    timer: 0.0,
+                    max_time: EXPLOSION_DURATION,
+                    max_radius: stats.blast_radius,
+                },
+            ));
+
             commands.entity(entity).despawn();
             game_state.phase = TurnPhase::TurnEnding;
             game_state.turn_end_timer = TURN_END_DELAY;
+        }
+    }
+}
+
+fn update_explosions(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut explosions: Query<(Entity, &mut Explosion, &mut Transform, &MeshMaterial2d<ColorMaterial>)>,
+) {
+    for (entity, mut explosion, mut transform, material_handle) in &mut explosions {
+        explosion.timer += time.delta_secs();
+
+        let progress = explosion.timer / explosion.max_time;
+
+        if progress >= 1.0 {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        // Expand quickly at first, then slow down
+        let size_progress = 1.0 - (1.0 - progress).powi(2);
+        // Circle mesh has radius 1.0, so scale equals final radius
+        let scale = explosion.max_radius * size_progress;
+        transform.scale = Vec3::splat(scale.max(0.1));
+
+        // Fade from orange to red to transparent
+        if let Some(material) = materials.get_mut(&material_handle.0) {
+            let alpha = 1.0 - progress;
+            let green = 0.6 * (1.0 - progress);
+            material.color = Color::srgba(1.0, green, 0.0, alpha);
         }
     }
 }
@@ -1174,6 +1229,7 @@ fn handle_game_over_buttons(
     base_query: Query<Entity, With<PlayerBase>>,
     projectile_query: Query<Entity, With<Projectile>>,
     health_bar_query: Query<Entity, With<HealthBar>>,
+    explosion_query: Query<Entity, With<Explosion>>,
 ) {
     // Handle exit button
     for interaction in &exit_query {
@@ -1199,6 +1255,9 @@ fn handle_game_over_buttons(
                 commands.entity(entity).despawn();
             }
             for entity in health_bar_query.iter() {
+                commands.entity(entity).despawn();
+            }
+            for entity in explosion_query.iter() {
                 commands.entity(entity).despawn();
             }
 
