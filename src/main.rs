@@ -83,6 +83,7 @@ fn main() {
                 update_aa_missiles,
                 check_projectile_phase_end,
                 process_pending_explosions,
+                process_pending_emps,
                 update_explosions,
                 rebuild_terrain_mesh,
                 update_falling_entities,
@@ -90,6 +91,7 @@ fn main() {
                 check_base_destruction,
                 check_structure_destruction,
                 reset_aa_launchers,
+                decrement_aa_disabled,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -226,6 +228,7 @@ enum Weapon {
     Artillery,
     ClusterGrenade,
     ClusterSubmunition,
+    EMP,
 }
 
 struct WeaponStats {
@@ -248,6 +251,10 @@ impl Weapon {
                 damage: 4.0,
                 blast_radius: 50.0,
             },
+            Weapon::EMP => WeaponStats {
+                damage: 0.0,
+                blast_radius: 300.0,
+            },
         }
     }
 
@@ -256,12 +263,13 @@ impl Weapon {
             Weapon::Artillery => "Artillery",
             Weapon::ClusterGrenade => "Cluster",
             Weapon::ClusterSubmunition => "Submunition",
+            Weapon::EMP => "EMP",
         }
     }
 
     fn is_selectable(&self) -> bool {
         match self {
-            Weapon::Artillery | Weapon::ClusterGrenade => true,
+            Weapon::Artillery | Weapon::ClusterGrenade | Weapon::EMP => true,
             Weapon::ClusterSubmunition => false,
         }
     }
@@ -315,6 +323,7 @@ struct GameState {
     turn_end_timer: f32,
     winner: Option<Player>,
     projectiles_seen: bool, // Track if we've seen projectiles this phase (for deferred spawn handling)
+    turn_start_processed: bool, // Track if turn-start logic has run for current turn
 }
 
 impl Default for GameState {
@@ -327,6 +336,7 @@ impl Default for GameState {
             turn_end_timer: 0.0,
             winner: None,
             projectiles_seen: false,
+            turn_start_processed: true, // First turn starts already processed
         }
     }
 }
@@ -397,6 +407,7 @@ struct BuildableAreaOverlay;
 struct AALauncher {
     player: Player,
     fired_this_turn: bool,
+    disabled_turns: u32,
 }
 
 /// Marker for entities that should fall due to gravity and rest on terrain
@@ -421,6 +432,11 @@ struct AAMissile {
 }
 
 #[derive(Component)]
+struct PendingEMP {
+    blast_radius: f32,
+}
+
+#[derive(Component)]
 struct ChargeIndicatorWorld;
 
 #[derive(Component)]
@@ -435,6 +451,7 @@ struct Explosion {
     timer: f32,
     max_time: f32,
     max_radius: f32,
+    is_emp: bool,
 }
 
 /// Marker for pending explosions that need to apply damage
@@ -558,6 +575,34 @@ fn setup_ui(mut commands: Commands) {
                     TextColor(Color::WHITE),
                 ));
 
+            // EMP button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    WeaponButton {
+                        weapon: Weapon::EMP,
+                    },
+                ))
+                .with_child((
+                    Text::new("EMP"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
             // AA Launcher button
             parent
                 .spawn((
@@ -613,7 +658,6 @@ fn setup_ui(mut commands: Commands) {
                     },
                     TextColor(Color::WHITE),
                 ));
-
         });
 
     // Weapon tooltip (hidden by default, positioned near cursor)
@@ -913,6 +957,14 @@ fn update_weapon_tooltip(
                 sub_stats.damage,
                 sub_stats.blast_radius
             ))
+        } else if weapon_button.weapon == Weapon::EMP {
+            let stats = weapon_button.weapon.stats();
+            Some(format!(
+                "{}\nDisables AA for {} turns\nBlast Radius: {}",
+                weapon_button.weapon.name(),
+                EMP_DISABLE_TURNS,
+                stats.blast_radius
+            ))
         } else {
             let stats = weapon_button.weapon.stats();
             Some(format!(
@@ -1192,6 +1244,7 @@ fn handle_building(
                     AALauncher {
                         player: game_state.current_player,
                         fired_this_turn: false,
+                        disabled_turns: 0,
                     },
                     Health::new(buildable.health()),
                     FallsWithGravity {
@@ -1482,6 +1535,7 @@ fn update_projectiles(
     let mut to_despawn = Vec::new();
     let mut submunitions_to_spawn = Vec::new();
     let mut explosions_to_spawn = Vec::new();
+    let mut emps_to_spawn = Vec::new();
 
     for (entity, mut transform, mut projectile, sprite) in &mut projectiles {
         let prev_vel_y = projectile.prev_velocity_y;
@@ -1575,7 +1629,10 @@ fn update_projectiles(
 
         if hit_structure || terrain_hit {
             let stats = projectile.weapon.stats();
-            if stats.blast_radius > 0.0 {
+            if projectile.weapon == Weapon::EMP {
+                // EMP has special handling - no damage, just disable effect
+                emps_to_spawn.push((pos, stats.blast_radius));
+            } else if stats.blast_radius > 0.0 {
                 explosions_to_spawn.push((pos, stats.damage, stats.blast_radius));
             }
             to_despawn.push(entity);
@@ -1607,6 +1664,14 @@ fn update_projectiles(
     // Spawn explosions
     for (pos, damage, blast_radius) in explosions_to_spawn {
         spawn_explosion(&mut commands, pos, damage, blast_radius);
+    }
+
+    // Spawn EMP effects
+    for (pos, blast_radius) in emps_to_spawn {
+        commands.spawn((
+            Transform::from_xyz(pos.x, pos.y, 2.0),
+            PendingEMP { blast_radius },
+        ));
     }
 }
 
@@ -1652,15 +1717,30 @@ fn process_pending_explosions(
     pending: Query<(Entity, &Transform, &PendingExplosion)>,
     mut player_bases: Query<
         (&Transform, &mut Health),
-        (With<PlayerBase>, Without<PendingExplosion>, Without<AALauncher>, Without<Wall>),
+        (
+            With<PlayerBase>,
+            Without<PendingExplosion>,
+            Without<AALauncher>,
+            Without<Wall>,
+        ),
     >,
     mut aa_launchers: Query<
         (&Transform, &mut Health),
-        (With<AALauncher>, Without<PendingExplosion>, Without<PlayerBase>, Without<Wall>),
+        (
+            With<AALauncher>,
+            Without<PendingExplosion>,
+            Without<PlayerBase>,
+            Without<Wall>,
+        ),
     >,
     mut walls: Query<
         (&Transform, &Sprite, &mut Health),
-        (With<Wall>, Without<PendingExplosion>, Without<PlayerBase>, Without<AALauncher>),
+        (
+            With<Wall>,
+            Without<PendingExplosion>,
+            Without<PlayerBase>,
+            Without<AALauncher>,
+        ),
     >,
     projectiles: Query<(Entity, &Transform, &Projectile), Without<PendingExplosion>>,
     aa_missiles: Query<(Entity, &Transform), (With<AAMissile>, Without<PendingExplosion>)>,
@@ -1734,9 +1814,18 @@ fn process_pending_explosions(
                 let distance = pos.distance(proj_pos);
 
                 if distance < explosion.blast_radius {
-                    // Spawn explosion for this projectile
+                    // Spawn explosion/EMP for this projectile
                     let stats = projectile.weapon.stats();
-                    spawn_explosion(&mut commands, proj_pos, stats.damage, stats.blast_radius);
+                    if projectile.weapon == Weapon::EMP {
+                        commands.spawn((
+                            Transform::from_xyz(proj_pos.x, proj_pos.y, 2.0),
+                            PendingEMP {
+                                blast_radius: stats.blast_radius,
+                            },
+                        ));
+                    } else if stats.blast_radius > 0.0 {
+                        spawn_explosion(&mut commands, proj_pos, stats.damage, stats.blast_radius);
+                    }
                     commands.entity(proj_entity).despawn();
                 }
             }
@@ -1764,11 +1853,57 @@ fn process_pending_explosions(
                     timer: 0.0,
                     max_time: EXPLOSION_DURATION,
                     max_radius: explosion.blast_radius,
+                    is_emp: false,
                 },
             ));
         }
 
         // Remove the pending explosion
+        commands.entity(entity).despawn();
+    }
+}
+
+// One player action is one turn.
+const EMP_DISABLE_TURNS: u32 = 5;
+
+fn process_pending_emps(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    pending: Query<(Entity, &Transform, &PendingEMP)>,
+    mut aa_launchers: Query<(&Transform, &mut AALauncher, &mut Sprite)>,
+) {
+    for (entity, transform, emp) in &pending {
+        let pos = transform.translation.truncate();
+
+        // Disable AA launchers in blast radius
+        for (aa_transform, mut aa_launcher, mut aa_sprite) in &mut aa_launchers {
+            let aa_pos = aa_transform.translation.truncate();
+            let distance = pos.distance(aa_pos);
+
+            if distance < emp.blast_radius {
+                aa_launcher.disabled_turns = EMP_DISABLE_TURNS;
+                // Visual indicator - darken the sprite
+                aa_sprite.color = Color::srgb(0.3, 0.3, 0.3);
+            }
+        }
+
+        // Spawn EMP visual effect (blue/electric colored expanding ring)
+        commands.spawn((
+            Mesh2d(meshes.add(Circle::new(1.0))),
+            MeshMaterial2d(
+                materials.add(ColorMaterial::from_color(Color::srgba(0.2, 0.5, 1.0, 0.8))),
+            ),
+            Transform::from_xyz(pos.x, pos.y, 2.0),
+            Explosion {
+                timer: 0.0,
+                max_time: EXPLOSION_DURATION,
+                max_radius: emp.blast_radius,
+                is_emp: true,
+            },
+        ));
+
+        // Remove the pending EMP
         commands.entity(entity).despawn();
     }
 }
@@ -1800,11 +1935,18 @@ fn update_explosions(
         let scale = explosion.max_radius * size_progress;
         transform.scale = Vec3::splat(scale.max(0.1));
 
-        // Fade from orange to red to transparent
+        // Update color based on explosion type
         if let Some(material) = materials.get_mut(&material_handle.0) {
             let alpha = 1.0 - progress;
-            let green = 0.6 * (1.0 - progress);
-            material.color = Color::srgba(1.0, green, 0.0, alpha);
+            if explosion.is_emp {
+                // EMP: fade from blue to cyan to transparent
+                let blue = 0.5 + 0.5 * (1.0 - progress);
+                material.color = Color::srgba(0.2, 0.5, blue, alpha);
+            } else {
+                // Normal: fade from orange to red to transparent
+                let green = 0.6 * (1.0 - progress);
+                material.color = Color::srgba(1.0, green, 0.0, alpha);
+            }
         }
     }
 }
@@ -1823,6 +1965,11 @@ fn aa_fire_missiles(
     for (aa_transform, mut aa_launcher) in &mut aa_launchers {
         // Only fire at enemy projectiles (AA belongs to player who isn't current)
         if aa_launcher.player == game_state.current_player {
+            continue;
+        }
+
+        // Can't fire if disabled by EMP
+        if aa_launcher.disabled_turns > 0 {
             continue;
         }
 
@@ -1966,6 +2113,7 @@ fn update_aa_missiles(
                     timer: 0.0,
                     max_time: EXPLOSION_DURATION * 0.5,
                     max_radius: AA_MISSILE_EXPLOSION_RADIUS * 0.5,
+                    is_emp: false,
                 },
             ));
             commands.entity(entity).despawn();
@@ -1985,9 +2133,17 @@ fn update_aa_missiles(
         // Check collision with closest target
         if let Some((target_entity, target_pos, target_weapon, distance)) = closest_target {
             if distance < AA_MISSILE_EXPLOSION_RADIUS {
-                // Hit! Trigger the projectile's explosion at the intercept point
+                // Hit! Trigger the projectile's effect at the intercept point
                 let stats = target_weapon.stats();
-                if stats.blast_radius > 0.0 {
+                if target_weapon == Weapon::EMP {
+                    // EMP still triggers when intercepted
+                    commands.spawn((
+                        Transform::from_xyz(target_pos.x, target_pos.y, 2.0),
+                        PendingEMP {
+                            blast_radius: stats.blast_radius,
+                        },
+                    ));
+                } else if stats.blast_radius > 0.0 {
                     spawn_explosion(&mut commands, target_pos, stats.damage, stats.blast_radius);
                 }
 
@@ -1999,15 +2155,39 @@ fn update_aa_missiles(
     }
 }
 
-fn reset_aa_launchers(game_state: Res<GameState>, mut aa_launchers: Query<&mut AALauncher>) {
-    // Reset fired_this_turn when turn ends
-    if game_state.phase != TurnPhase::Aiming {
+fn reset_aa_launchers(mut game_state: ResMut<GameState>, mut aa_launchers: Query<&mut AALauncher>) {
+    // Only run once at the start of each turn
+    if game_state.phase != TurnPhase::Aiming || game_state.turn_start_processed {
         return;
     }
 
     for mut aa_launcher in &mut aa_launchers {
         aa_launcher.fired_this_turn = false;
     }
+}
+
+fn decrement_aa_disabled(
+    mut game_state: ResMut<GameState>,
+    mut aa_launchers: Query<(&mut AALauncher, &mut Sprite)>,
+) {
+    // Only run once at the start of each turn
+    if game_state.phase != TurnPhase::Aiming || game_state.turn_start_processed {
+        return;
+    }
+
+    for (mut aa_launcher, mut sprite) in &mut aa_launchers {
+        if aa_launcher.disabled_turns > 0 {
+            aa_launcher.disabled_turns -= 1;
+
+            // Restore color when no longer disabled
+            if aa_launcher.disabled_turns == 0 {
+                sprite.color = aa_launcher.player.color();
+            }
+        }
+    }
+
+    // Mark turn start as processed
+    game_state.turn_start_processed = true;
 }
 
 fn rebuild_terrain_mesh(
@@ -2096,7 +2276,8 @@ fn update_falling_entities(
             // Check horizontal overlap
             let half_width = width / 2.0;
             let other_half_width = other_size.x / 2.0;
-            let horizontal_overlap = (x - other_pos.x).abs() < (half_width + other_half_width - 5.0);
+            let horizontal_overlap =
+                (x - other_pos.x).abs() < (half_width + other_half_width - 5.0);
 
             if horizontal_overlap {
                 // Top of the other entity
@@ -2128,9 +2309,18 @@ fn update_falling_entities(
 }
 
 fn update_health_bars(
-    bases: Query<(Entity, &Transform, &Health), (With<PlayerBase>, Without<AALauncher>, Without<Wall>)>,
-    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<PlayerBase>, Without<Wall>)>,
-    walls: Query<(Entity, &Transform, &Sprite, &Health), (With<Wall>, Without<PlayerBase>, Without<AALauncher>)>,
+    bases: Query<
+        (Entity, &Transform, &Health),
+        (With<PlayerBase>, Without<AALauncher>, Without<Wall>),
+    >,
+    aa_launchers: Query<
+        (Entity, &Transform, &Health),
+        (With<AALauncher>, Without<PlayerBase>, Without<Wall>),
+    >,
+    walls: Query<
+        (Entity, &Transform, &Sprite, &Health),
+        (With<Wall>, Without<PlayerBase>, Without<AALauncher>),
+    >,
     mut health_bars: Query<
         (&mut Text2d, &mut Transform, &HealthBar),
         (
@@ -2142,7 +2332,12 @@ fn update_health_bars(
     >,
     mut health_bar_backgrounds: Query<
         (&mut Transform, &HealthBarBackground),
-        (Without<PlayerBase>, Without<HealthBar>, Without<AALauncher>, Without<Wall>),
+        (
+            Without<PlayerBase>,
+            Without<HealthBar>,
+            Without<AALauncher>,
+            Without<Wall>,
+        ),
     >,
 ) {
     for (mut text, mut bar_transform, health_bar) in &mut health_bars {
@@ -2275,6 +2470,7 @@ fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
         game_state.current_player = game_state.current_player.next();
         game_state.selected_weapon = None;
         game_state.phase = TurnPhase::Aiming;
+        game_state.turn_start_processed = false;
     }
 }
 
@@ -2472,7 +2668,9 @@ fn spawn_player_bases(
                 Transform::from_xyz(x, y, 1.0),
                 PlayerBase { player },
                 Health::new(PLAYER_BASE_HEALTH),
-                FallsWithGravity { size: PLAYER_BASE_SIZE },
+                FallsWithGravity {
+                    size: PLAYER_BASE_SIZE,
+                },
                 ExtendsBuildArea { player },
             ))
             .id();
