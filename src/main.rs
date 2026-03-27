@@ -1156,7 +1156,7 @@ fn update_weapon_tooltip(
         if weapon_button.weapon == Weapon::ClusterGrenade {
             let sub_stats = Weapon::ClusterSubmunition.stats();
             Some(format!(
-                "{}\n5x Submunitions\nDamage: {} each\nBlast Radius: {}",
+                "{}\n6x Submunitions\nDamage: {} each\nBlast Radius: {}",
                 weapon_button.weapon.name(),
                 sub_stats.damage,
                 sub_stats.blast_radius
@@ -1883,7 +1883,7 @@ fn update_projectiles(
             Without<ShieldGenerator>,
         ),
     >,
-    mut shield_generators: Query<(Entity, &Transform, &mut ShieldGenerator), Without<Projectile>>,
+    mut shield_generators: Query<(Entity, &Transform, &mut ShieldGenerator, &mut Sprite), Without<Projectile>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -1928,7 +1928,7 @@ fn update_projectiles(
             let base_velocity = projectile.velocity;
             let color = sprite.color;
 
-            for i in 0..8 {
+            for i in 0..6 {
                 // Spread angle: -10 to +10 degrees from current direction
                 let angle_offset = ((i as f32 - 2.0) / 2.0) * 0.18; // ~10 degrees
                 let random_offset = rng.random_range(-0.05..0.05);
@@ -1961,7 +1961,7 @@ fn update_projectiles(
 
         // Check shield collision first (shields protect structures behind them)
         let mut hit_shield = false;
-        for (gen_entity, gen_transform, generator) in &shield_generators {
+        for (gen_entity, gen_transform, generator, _) in &shield_generators {
             // Skip friendly shields (projectiles pass through own team's shields)
             if generator.player == projectile.player {
                 continue;
@@ -2065,8 +2065,13 @@ fn update_projectiles(
 
     // Apply shield damage
     for (gen_entity, damage, _hit_pos) in shield_hits {
-        if let Ok((_, _, mut generator)) = shield_generators.get_mut(gen_entity) {
+        if let Ok((_, _, mut generator, mut sprite)) = shield_generators.get_mut(gen_entity) {
             generator.shield_health = (generator.shield_health - damage).max(0.0);
+            // Disable shield when depleted (same as EMP effect)
+            if generator.shield_health <= 0.0 && generator.disabled_turns == 0 {
+                generator.disabled_turns = EMP_DISABLE_TURNS;
+                sprite.color = Color::srgb(0.3, 0.3, 0.3);
+            }
         }
     }
 
