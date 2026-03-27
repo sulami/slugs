@@ -417,7 +417,6 @@ struct ExtendsBuildArea {
 #[derive(Component)]
 struct AAMissile {
     velocity: Vec2,
-    target: Entity,
     distance_traveled: f32,
 }
 
@@ -1870,7 +1869,6 @@ fn aa_fire_missiles(
                     )),
                 AAMissile {
                     velocity: direction * initial_speed,
-                    target: target_entity,
                     distance_traveled: 0.0,
                 },
             ));
@@ -1884,8 +1882,9 @@ fn update_aa_missiles(
     mut commands: Commands,
     game_state: Res<GameState>,
     time: Res<Time>,
+    terrain_data: Res<TerrainData>,
     mut missiles: Query<(Entity, &mut Transform, &mut AAMissile)>,
-    projectiles: Query<(&Transform, &Projectile), Without<AAMissile>>,
+    projectiles: Query<(Entity, &Transform, &Projectile), Without<AAMissile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
@@ -1896,50 +1895,48 @@ fn update_aa_missiles(
     let dt = time.delta_secs();
 
     for (entity, mut transform, mut missile) in &mut missiles {
-        // Check if target still exists and get its data
-        let (target_pos, target_weapon) =
-            if let Ok((target_transform, projectile)) = projectiles.get(missile.target) {
-                (
-                    target_transform.translation.truncate(),
-                    projectile.weapon,
-                )
-            } else {
-                // Target destroyed, despawn missile
-                commands.entity(entity).despawn();
-                continue;
-            };
-
         let pos = transform.translation.truncate();
 
-        // Calculate desired direction to target
-        let to_target = target_pos - pos;
-        let desired_direction = to_target.normalize_or_zero();
+        // Find closest projectile to target
+        let closest_target = projectiles
+            .iter()
+            .map(|(e, t, p)| {
+                let proj_pos = t.translation.truncate();
+                let distance = pos.distance(proj_pos);
+                (e, proj_pos, p.weapon, distance)
+            })
+            .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
 
         // Current direction from velocity
         let current_speed = missile.velocity.length();
-        let current_direction = if current_speed > 0.1 {
-            missile.velocity / current_speed
-        } else {
-            desired_direction
-        };
-
-        // Calculate angle difference and apply turn rate limit
+        let current_direction = missile.velocity.normalize_or_zero();
         let current_angle = current_direction.y.atan2(current_direction.x);
-        let desired_angle = desired_direction.y.atan2(desired_direction.x);
-        let mut angle_diff = desired_angle - current_angle;
 
-        // Normalize angle difference to [-PI, PI]
-        while angle_diff > std::f32::consts::PI {
-            angle_diff -= 2.0 * std::f32::consts::PI;
-        }
-        while angle_diff < -std::f32::consts::PI {
-            angle_diff += 2.0 * std::f32::consts::PI;
-        }
+        // If we have a target, steer towards it
+        let new_angle = if let Some((_, target_pos, _, _)) = closest_target {
+            let to_target = target_pos - pos;
+            let desired_direction = to_target.normalize_or_zero();
+            let desired_angle = desired_direction.y.atan2(desired_direction.x);
 
-        // Apply turn rate limit
-        let max_turn = AA_MISSILE_TURN_RATE * dt;
-        let actual_turn = angle_diff.clamp(-max_turn, max_turn);
-        let new_angle = current_angle + actual_turn;
+            // Calculate angle difference
+            let mut angle_diff = desired_angle - current_angle;
+
+            // Normalize angle difference to [-PI, PI]
+            while angle_diff > std::f32::consts::PI {
+                angle_diff -= 2.0 * std::f32::consts::PI;
+            }
+            while angle_diff < -std::f32::consts::PI {
+                angle_diff += 2.0 * std::f32::consts::PI;
+            }
+
+            // Apply turn rate limit
+            let max_turn = AA_MISSILE_TURN_RATE * dt;
+            let actual_turn = angle_diff.clamp(-max_turn, max_turn);
+            current_angle + actual_turn
+        } else {
+            // No target, keep flying straight
+            current_angle
+        };
 
         let new_direction = Vec2::new(new_angle.cos(), new_angle.sin());
 
@@ -1975,18 +1972,29 @@ fn update_aa_missiles(
             continue;
         }
 
-        // Check collision with target
-        let distance_to_target = to_target.length();
-        if distance_to_target < AA_MISSILE_EXPLOSION_RADIUS {
-            // Hit! Trigger the projectile's explosion at the intercept point
-            let stats = target_weapon.stats();
-            if stats.blast_radius > 0.0 {
-                spawn_explosion(&mut commands, target_pos, stats.damage, stats.blast_radius);
+        // Check terrain collision
+        if let Some(terrain_height) = terrain_data.get_height_at(pos.x) {
+            if pos.y < terrain_height {
+                // Hit ground - small explosion
+                spawn_explosion(&mut commands, pos, 1.0, 20.0);
+                commands.entity(entity).despawn();
+                continue;
             }
+        }
 
-            // Destroy the projectile and missile
-            commands.entity(missile.target).despawn();
-            commands.entity(entity).despawn();
+        // Check collision with closest target
+        if let Some((target_entity, target_pos, target_weapon, distance)) = closest_target {
+            if distance < AA_MISSILE_EXPLOSION_RADIUS {
+                // Hit! Trigger the projectile's explosion at the intercept point
+                let stats = target_weapon.stats();
+                if stats.blast_radius > 0.0 {
+                    spawn_explosion(&mut commands, target_pos, stats.damage, stats.blast_radius);
+                }
+
+                // Destroy the projectile and missile
+                commands.entity(target_entity).despawn();
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
