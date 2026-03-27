@@ -18,6 +18,17 @@ const ZOOM_SPEED: f32 = 0.1;
 // Player settings
 const PLAYER_BASE_SIZE: f32 = 40.0;
 
+// Projectile settings
+const GRAVITY: f32 = 400.0;
+const MAX_CHARGE_TIME: f32 = 2.0;
+const MAX_LAUNCH_SPEED: f32 = 1200.0;
+const PROJECTILE_RADIUS: f32 = 8.0;
+const TURN_END_DELAY: f32 = 1.5;
+
+// Aiming settings
+const AIM_LINE_LENGTH: f32 = 500.0;
+const TICK_MARK_SIZE: f32 = 15.0;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -30,8 +41,22 @@ fn main() {
         }))
         .init_resource::<GameState>()
         .init_resource::<TerrainData>()
+        .init_resource::<AimingState>()
         .add_systems(Startup, (setup_camera, generate_terrain, setup_ui))
-        .add_systems(Update, (camera_zoom, camera_pan, update_turn_indicator))
+        .add_systems(
+            Update,
+            (
+                camera_zoom,
+                camera_pan,
+                update_turn_indicator,
+                handle_weapon_selection,
+                handle_aiming,
+                update_aim_line,
+                update_charge_indicator,
+                update_projectiles,
+                check_turn_end,
+            ),
+        )
         .run();
 }
 
@@ -39,6 +64,35 @@ fn main() {
 #[derive(Resource, Default)]
 struct TerrainData {
     heights: Vec<f32>,
+}
+
+impl TerrainData {
+    fn get_height_at(&self, world_x: f32) -> Option<f32> {
+        if self.heights.is_empty() {
+            return None;
+        }
+
+        let half_width = WORLD_WIDTH / 2.0;
+        let half_height = WORLD_HEIGHT / 2.0;
+
+        // Convert world x to terrain segment
+        let terrain_x = world_x + half_width;
+        let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
+        let segment_f = terrain_x / segment_width;
+        let segment = segment_f as usize;
+
+        if segment >= TERRAIN_SEGMENTS {
+            return None;
+        }
+
+        // Interpolate between segment heights
+        let t = segment_f.fract();
+        let h0 = self.heights[segment];
+        let h1 = self.heights[segment + 1];
+        let height = h0 + (h1 - h0) * t;
+
+        Some(height - half_height)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -61,19 +115,51 @@ impl Player {
             Player::Red => "Red",
         }
     }
+
+    fn next(&self) -> Player {
+        match self {
+            Player::Blue => Player::Red,
+            Player::Red => Player::Blue,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Weapon {
+    Artillery,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum TurnPhase {
+    #[default]
+    Aiming,
+    ProjectileInFlight,
+    TurnEnding,
 }
 
 #[derive(Resource)]
 struct GameState {
     current_player: Player,
+    selected_weapon: Option<Weapon>,
+    phase: TurnPhase,
+    turn_end_timer: f32,
 }
 
 impl Default for GameState {
     fn default() -> Self {
         Self {
             current_player: Player::Blue,
+            selected_weapon: None,
+            phase: TurnPhase::Aiming,
+            turn_end_timer: 0.0,
         }
     }
+}
+
+#[derive(Resource, Default)]
+struct AimingState {
+    charging: bool,
+    charge_time: f32,
 }
 
 // Components
@@ -91,6 +177,19 @@ struct PlayerBase {
 #[derive(Component)]
 struct TurnIndicator;
 
+#[derive(Component)]
+struct WeaponButton {
+    weapon: Weapon,
+}
+
+#[derive(Component)]
+struct ChargeIndicatorWorld;
+
+#[derive(Component)]
+struct Projectile {
+    velocity: Vec2,
+}
+
 fn setup_camera(mut commands: Commands) {
     // Start zoomed out to see the whole world
     let initial_scale = WORLD_WIDTH / WINDOW_WIDTH as f32;
@@ -102,6 +201,7 @@ fn setup_camera(mut commands: Commands) {
 }
 
 fn setup_ui(mut commands: Commands) {
+    // Turn indicator
     commands.spawn((
         Text::new("Blue's Turn"),
         TextFont {
@@ -117,6 +217,58 @@ fn setup_ui(mut commands: Commands) {
         },
         TurnIndicator,
     ));
+
+    // Weapon toolbar at bottom
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(10.0),
+            left: Val::Px(10.0),
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|parent| {
+            // Artillery button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    WeaponButton {
+                        weapon: Weapon::Artillery,
+                    },
+                ))
+                .with_child((
+                    Text::new("Artillery"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+        });
+
+    // World-space charge indicator (will be positioned near base during aiming)
+    commands.spawn((
+        Text2d::new(""),
+        TextFont {
+            font_size: 36.0,
+            ..default()
+        },
+        TextColor(Color::srgb(1.0, 0.7, 0.0)),
+        Transform::from_xyz(0.0, 0.0, 10.0),
+        Visibility::Hidden,
+        ChargeIndicatorWorld,
+    ));
 }
 
 fn update_turn_indicator(
@@ -130,6 +282,344 @@ fn update_turn_indicator(
     for (mut text, mut color) in &mut query {
         **text = format!("{}'s Turn", game_state.current_player.name());
         *color = TextColor(game_state.current_player.color());
+    }
+}
+
+fn handle_weapon_selection(
+    mut game_state: ResMut<GameState>,
+    interaction_query: Query<(&Interaction, &WeaponButton), Changed<Interaction>>,
+    mut button_query: Query<(&WeaponButton, &mut BorderColor)>,
+) {
+    // Handle clicks
+    for (interaction, weapon_button) in &interaction_query {
+        if *interaction == Interaction::Pressed {
+            game_state.selected_weapon = Some(weapon_button.weapon);
+        }
+    }
+
+    // Update button visuals
+    for (weapon_button, mut border_color) in &mut button_query {
+        if game_state.selected_weapon == Some(weapon_button.weapon) {
+            *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+        } else {
+            *border_color = BorderColor::all(Color::WHITE);
+        }
+    }
+}
+
+fn handle_aiming(
+    mut commands: Commands,
+    mut game_state: ResMut<GameState>,
+    mut aiming_state: ResMut<AimingState>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    camera_query: Query<&Transform, With<MainCamera>>,
+    player_bases: Query<(&Transform, &PlayerBase), Without<MainCamera>>,
+    time: Res<Time>,
+    interaction_query: Query<&Interaction, With<Button>>,
+) {
+    // Only allow aiming if a weapon is selected
+    if game_state.phase != TurnPhase::Aiming || game_state.selected_weapon.is_none() {
+        aiming_state.charging = false;
+        aiming_state.charge_time = 0.0;
+        return;
+    }
+
+    // Don't start charging if clicking on a UI button
+    let clicking_ui = interaction_query.iter().any(|i| *i != Interaction::None);
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+
+    // Find current player's base position
+    let Some(base_pos) = player_bases.iter().find_map(|(transform, base)| {
+        if base.player == game_state.current_player {
+            Some(transform.translation.truncate())
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+
+    // Get cursor world position
+    let Some(cursor_position) = window.cursor_position() else {
+        return;
+    };
+    let window_size = Vec2::new(window.width(), window.height());
+    let cursor_ndc = (cursor_position - window_size / 2.0) * Vec2::new(1.0, -1.0);
+    let cursor_world =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    // Calculate aim direction
+    let aim_direction = (cursor_world - base_pos).normalize_or_zero();
+
+    if mouse_button.just_pressed(MouseButton::Left) && !clicking_ui {
+        aiming_state.charging = true;
+        aiming_state.charge_time = 0.0;
+    }
+
+    if aiming_state.charging {
+        aiming_state.charge_time =
+            (aiming_state.charge_time + time.delta_secs()).min(MAX_CHARGE_TIME);
+    }
+
+    if mouse_button.just_released(MouseButton::Left) && aiming_state.charging {
+        // Fire projectile
+        let speed = (aiming_state.charge_time / MAX_CHARGE_TIME) * MAX_LAUNCH_SPEED;
+        let velocity = aim_direction * speed;
+
+        let start = base_pos + Vec2::Y * (PLAYER_BASE_SIZE / 2.0);
+        commands.spawn((
+            Sprite {
+                color: game_state.current_player.color(),
+                custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
+                ..default()
+            },
+            Transform::from_xyz(start.x, start.y, 2.0),
+            Projectile { velocity },
+        ));
+
+        aiming_state.charging = false;
+        aiming_state.charge_time = 0.0;
+        game_state.phase = TurnPhase::ProjectileInFlight;
+    }
+}
+
+fn update_aim_line(
+    mut gizmos: Gizmos,
+    game_state: Res<GameState>,
+    aiming_state: Res<AimingState>,
+    windows: Query<&Window>,
+    camera_query: Query<&Transform, With<MainCamera>>,
+    player_bases: Query<(&Transform, &PlayerBase), Without<MainCamera>>,
+) {
+    // Only show aim line if weapon is selected and in aiming phase
+    if game_state.phase != TurnPhase::Aiming || game_state.selected_weapon.is_none() {
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+
+    // Find current player's base position
+    let Some(base_pos) = player_bases.iter().find_map(|(transform, base)| {
+        if base.player == game_state.current_player {
+            Some(transform.translation.truncate())
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+
+    // Get cursor world position
+    let Some(cursor_position) = window.cursor_position() else {
+        return;
+    };
+    let window_size = Vec2::new(window.width(), window.height());
+    let cursor_ndc = (cursor_position - window_size / 2.0) * Vec2::new(1.0, -1.0);
+    let cursor_world =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    // Calculate aim direction (fixed length line)
+    let start = base_pos + Vec2::Y * (PLAYER_BASE_SIZE / 2.0);
+    let aim_direction = (cursor_world - start).normalize_or_zero();
+    let end = start + aim_direction * AIM_LINE_LENGTH;
+
+    // Calculate perpendicular direction for tick marks
+    let perp = Vec2::new(-aim_direction.y, aim_direction.x);
+
+    // Draw the main aim line (white/gray)
+    gizmos.line_2d(start, end, Color::srgb(0.7, 0.7, 0.7));
+
+    // Draw tick marks at 25%, 50%, 75%, 100%
+    for i in 1..=4 {
+        let t = i as f32 * 0.25;
+        let tick_pos = start + aim_direction * (AIM_LINE_LENGTH * t);
+        let tick_half = perp * (TICK_MARK_SIZE / 2.0);
+        gizmos.line_2d(
+            tick_pos - tick_half,
+            tick_pos + tick_half,
+            Color::srgb(0.7, 0.7, 0.7),
+        );
+    }
+
+    // Draw charge line (orange/yellow gradient effect via segments)
+    if aiming_state.charging {
+        let charge_fraction = aiming_state.charge_time / MAX_CHARGE_TIME;
+        let charge_length = AIM_LINE_LENGTH * charge_fraction;
+
+        // Draw gradient segments
+        let num_segments = 10;
+        for i in 0..num_segments {
+            let seg_start_t = i as f32 / num_segments as f32;
+            let seg_end_t = (i + 1) as f32 / num_segments as f32;
+
+            // Only draw if this segment is within the charge
+            if seg_start_t >= charge_fraction {
+                break;
+            }
+
+            let actual_end_t = seg_end_t.min(charge_fraction);
+            let seg_start = start + aim_direction * (AIM_LINE_LENGTH * seg_start_t);
+            let seg_end = start + aim_direction * (AIM_LINE_LENGTH * actual_end_t);
+
+            // Interpolate color from yellow to orange/red based on position
+            let color_t = (seg_start_t + actual_end_t) / 2.0;
+            let r = 1.0;
+            let g = 1.0 - color_t * 0.6; // Goes from 1.0 (yellow) to 0.4 (orange-red)
+            let b = 0.0;
+
+            gizmos.line_2d(seg_start, seg_end, Color::srgb(r, g, b));
+        }
+
+        // Draw small circle at charge end
+        let charge_end = start + aim_direction * charge_length;
+        gizmos.circle_2d(charge_end, 5.0, Color::srgb(1.0, 0.5, 0.0));
+    }
+}
+
+fn update_charge_indicator(
+    game_state: Res<GameState>,
+    aiming_state: Res<AimingState>,
+    windows: Query<&Window>,
+    camera_query: Query<
+        &Transform,
+        (
+            With<MainCamera>,
+            Without<ChargeIndicatorWorld>,
+            Without<PlayerBase>,
+        ),
+    >,
+    player_bases: Query<
+        (&Transform, &PlayerBase),
+        (Without<MainCamera>, Without<ChargeIndicatorWorld>),
+    >,
+    mut indicator_query: Query<
+        (&mut Text2d, &mut Transform, &mut Visibility),
+        With<ChargeIndicatorWorld>,
+    >,
+) {
+    let Ok((mut text, mut transform, mut visibility)) = indicator_query.single_mut() else {
+        return;
+    };
+
+    // Hide if not aiming or not charging
+    if game_state.phase != TurnPhase::Aiming
+        || game_state.selected_weapon.is_none()
+        || !aiming_state.charging
+    {
+        *visibility = Visibility::Hidden;
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+
+    // Find current player's base position
+    let Some(base_pos) = player_bases.iter().find_map(|(t, base)| {
+        if base.player == game_state.current_player {
+            Some(t.translation.truncate())
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+
+    // Get cursor world position for aim direction
+    let Some(cursor_position) = window.cursor_position() else {
+        return;
+    };
+    let window_size = Vec2::new(window.width(), window.height());
+    let cursor_ndc = (cursor_position - window_size / 2.0) * Vec2::new(1.0, -1.0);
+    let cursor_world =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    let start = base_pos + Vec2::Y * (PLAYER_BASE_SIZE / 2.0);
+    let aim_direction = (cursor_world - start).normalize_or_zero();
+
+    // Position text offset from the base, perpendicular to aim direction
+    let perp = Vec2::new(-aim_direction.y, aim_direction.x);
+    let text_offset = perp * 50.0 - aim_direction * 20.0; // Offset to the side and slightly back
+    let text_pos = start + text_offset;
+
+    // Update text and position
+    let charge_percent = (aiming_state.charge_time / MAX_CHARGE_TIME * 100.0) as u32;
+    **text = format!("{}%", charge_percent);
+    transform.translation.x = text_pos.x;
+    transform.translation.y = text_pos.y;
+    *visibility = Visibility::Visible;
+}
+
+fn update_projectiles(
+    mut commands: Commands,
+    mut game_state: ResMut<GameState>,
+    terrain_data: Res<TerrainData>,
+    time: Res<Time>,
+    mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
+) {
+    if game_state.phase != TurnPhase::ProjectileInFlight {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    let half_width = WORLD_WIDTH / 2.0;
+
+    for (entity, mut transform, mut projectile) in &mut projectiles {
+        // Apply gravity
+        projectile.velocity.y -= GRAVITY * dt;
+
+        // Update position
+        transform.translation.x += projectile.velocity.x * dt;
+        transform.translation.y += projectile.velocity.y * dt;
+
+        let pos = transform.translation.truncate();
+
+        // Check world bounds
+        if pos.x < -half_width || pos.x > half_width {
+            commands.entity(entity).despawn();
+            game_state.phase = TurnPhase::TurnEnding;
+            game_state.turn_end_timer = TURN_END_DELAY;
+            continue;
+        }
+
+        // Check terrain collision
+        if let Some(terrain_height) = terrain_data.get_height_at(pos.x) {
+            if pos.y <= terrain_height {
+                // Hit terrain
+                commands.entity(entity).despawn();
+                game_state.phase = TurnPhase::TurnEnding;
+                game_state.turn_end_timer = TURN_END_DELAY;
+            }
+        }
+    }
+}
+
+fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
+    if game_state.phase != TurnPhase::TurnEnding {
+        return;
+    }
+
+    game_state.turn_end_timer -= time.delta_secs();
+
+    if game_state.turn_end_timer <= 0.0 {
+        game_state.current_player = game_state.current_player.next();
+        game_state.selected_weapon = None;
+        game_state.phase = TurnPhase::Aiming;
     }
 }
 
