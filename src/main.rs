@@ -84,7 +84,7 @@ fn main() {
                 check_projectile_phase_end,
                 update_explosions,
                 rebuild_terrain_mesh,
-                update_falling_bases,
+                update_falling_entities,
                 update_health_bars,
                 check_base_destruction,
                 check_aa_destruction,
@@ -392,6 +392,12 @@ struct BuildableAreaOverlay;
 struct AALauncher {
     player: Player,
     fired_this_turn: bool,
+}
+
+/// Marker for entities that should fall due to gravity and rest on terrain
+#[derive(Component)]
+struct FallsWithGravity {
+    size: f32, // Used to calculate bottom of entity
 }
 
 #[derive(Component)]
@@ -1129,6 +1135,7 @@ fn handle_building(
                     fired_this_turn: false,
                 },
                 Health::new(buildable.health()),
+                FallsWithGravity { size: buildable.size() },
             ))
             .id();
 
@@ -1898,31 +1905,31 @@ fn rebuild_terrain_mesh(
     mesh.insert_indices(Indices::U32(indices));
 }
 
-fn update_falling_bases(
+fn update_falling_entities(
     terrain_data: Res<TerrainData>,
-    mut bases: Query<&mut Transform, With<PlayerBase>>,
+    mut entities: Query<(&mut Transform, &FallsWithGravity)>,
     time: Res<Time>,
 ) {
-    for mut transform in &mut bases {
-        let base_x = transform.translation.x;
-        let base_bottom = transform.translation.y - PLAYER_BASE_SIZE / 2.0;
+    for (mut transform, falls) in &mut entities {
+        let x = transform.translation.x;
+        let bottom = transform.translation.y - falls.size / 2.0;
 
-        // Get terrain height at base position
-        if let Some(terrain_height) = terrain_data.get_height_at(base_x) {
-            // If base is above terrain, make it fall
-            if base_bottom > terrain_height + 1.0 {
+        // Get terrain height at entity position
+        if let Some(terrain_height) = terrain_data.get_height_at(x) {
+            // If entity is above terrain, make it fall
+            if bottom > terrain_height + 1.0 {
                 // Apply gravity
                 let fall_speed = GRAVITY * time.delta_secs();
                 transform.translation.y -= fall_speed;
 
                 // Don't fall below terrain
-                let min_y = terrain_height + PLAYER_BASE_SIZE / 2.0;
+                let min_y = terrain_height + falls.size / 2.0;
                 if transform.translation.y < min_y {
                     transform.translation.y = min_y;
                 }
             } else {
                 // Snap to terrain if close
-                transform.translation.y = terrain_height + PLAYER_BASE_SIZE / 2.0;
+                transform.translation.y = terrain_height + falls.size / 2.0;
             }
         }
     }
@@ -2239,6 +2246,7 @@ fn spawn_player_bases(
                 Transform::from_xyz(x, y, 1.0),
                 PlayerBase { player },
                 Health::new(PLAYER_BASE_HEALTH),
+                FallsWithGravity { size: PLAYER_BASE_SIZE },
             ))
             .id();
 
