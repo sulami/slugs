@@ -435,9 +435,14 @@ struct FallsWithGravity {
 #[derive(Component)]
 struct Wall;
 
-const SHIELD_RADIUS: f32 = 100.0;
+const SHIELD_RADIUS: f32 = 200.0;
 const SHIELD_MAX_HEALTH: f32 = 10.0;
 const SHIELD_RECHARGE_PER_TURN: f32 = 3.0;
+const SHIELD_MIN_THICKNESS: f32 = 2.0;
+const SHIELD_MAX_THICKNESS: f32 = 10.0;
+// Shield arc coverage: 135° total (from horizontal front to 45° past vertical on back)
+// Half angle is 67.5°, so shield extends 67.5° above and below the facing direction
+const SHIELD_ARC_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_4 * 1.5; // 67.5 degrees
 
 #[derive(Component)]
 struct ShieldGenerator {
@@ -446,10 +451,79 @@ struct ShieldGenerator {
     disabled_turns: u32,
 }
 
+/// Creates a shield arc mesh with the given thickness, facing direction based on player
+/// Shield starts at horizontal (front) and extends 135° toward the back (upward)
+fn create_shield_mesh(thickness: f32, player: Player) -> Mesh {
+    let segments = 32;
+    let inner_radius = SHIELD_RADIUS - thickness;
+    let outer_radius = SHIELD_RADIUS;
+
+    // Blue faces right: front is 0° (right), arc goes from 0° to 135° (toward top-left)
+    // Red faces left: front is 180° (left), arc goes from 180° down to 45° (toward top-right)
+    let (start_angle, end_angle) = match player {
+        Player::Blue => (0.0, SHIELD_ARC_HALF_ANGLE * 2.0), // 0° to 135°
+        Player::Red => (
+            std::f32::consts::PI - SHIELD_ARC_HALF_ANGLE * 2.0,
+            std::f32::consts::PI,
+        ), // 45° to 180°
+    };
+    let angle_range = end_angle - start_angle;
+
+    let mut vertices = Vec::new();
+    for i in 0..=segments {
+        let angle = start_angle + angle_range * (i as f32 / segments as f32);
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        vertices.push([cos_a * inner_radius, sin_a * inner_radius, 0.0]);
+        vertices.push([cos_a * outer_radius, sin_a * outer_radius, 0.0]);
+    }
+
+    let mut indices = Vec::new();
+    for i in 0..segments {
+        let base = (i * 2) as u32;
+        indices.push(base);
+        indices.push(base + 1);
+        indices.push(base + 2);
+        indices.push(base + 1);
+        indices.push(base + 3);
+        indices.push(base + 2);
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+/// Checks if a point is within the shield arc for a given player
+/// Shield starts at horizontal (front) and extends 135° toward the back (upward)
+fn point_in_shield(rel_pos: Vec2, player: Player) -> bool {
+    let distance = rel_pos.length();
+    if distance > SHIELD_RADIUS {
+        return false;
+    }
+
+    // Calculate angle of the point (atan2 gives angle from -PI to PI)
+    let angle = rel_pos.y.atan2(rel_pos.x);
+
+    // Blue faces right: arc from 0° to 135°
+    // Red faces left: arc from 45° to 180°
+    let (min_angle, max_angle) = match player {
+        Player::Blue => (0.0, SHIELD_ARC_HALF_ANGLE * 2.0),
+        Player::Red => (
+            std::f32::consts::PI - SHIELD_ARC_HALF_ANGLE * 2.0,
+            std::f32::consts::PI,
+        ),
+    };
+
+    angle >= min_angle && angle <= max_angle
+}
+
 /// Visual entity for the shield dome
 #[derive(Component)]
 struct ShieldDome {
     owner: Entity,
+    last_health: f32, // Track health to rebuild mesh when thickness changes
 }
 
 /// Marker for structures that extend the buildable area for a player
@@ -824,35 +898,8 @@ fn setup_ui(
 
     // Shield preview arc (shown when placing shield generator)
     {
-        let segments = 32;
-        let thickness = 3.0;
-        let inner_radius = SHIELD_RADIUS - thickness;
-        let outer_radius = SHIELD_RADIUS;
-
-        let mut vertices = Vec::new();
-        for i in 0..=segments {
-            let angle = std::f32::consts::PI * (i as f32 / segments as f32);
-            let cos_a = angle.cos();
-            let sin_a = angle.sin();
-            vertices.push([cos_a * inner_radius, sin_a * inner_radius, 0.0]);
-            vertices.push([cos_a * outer_radius, sin_a * outer_radius, 0.0]);
-        }
-
-        let mut indices = Vec::new();
-        for i in 0..segments {
-            let base = (i * 2) as u32;
-            indices.push(base);
-            indices.push(base + 1);
-            indices.push(base + 2);
-            indices.push(base + 1);
-            indices.push(base + 3);
-            indices.push(base + 2);
-        }
-
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
-        mesh.insert_indices(Indices::U32(indices));
-
+        // Use Blue as default, will be updated when shown
+        let mesh = create_shield_mesh(SHIELD_MAX_THICKNESS, Player::Blue);
         commands.spawn((
             Mesh2d(meshes.add(mesh)),
             MeshMaterial2d(
@@ -1354,7 +1401,7 @@ fn handle_building(
         ),
     >,
     mut shield_preview_query: Query<
-        (&mut Transform, &mut Visibility),
+        (&mut Transform, &mut Visibility, &mut Mesh2d),
         (
             With<ShieldPreview>,
             Without<BuildPreview>,
@@ -1365,6 +1412,7 @@ fn handle_building(
             Without<FallsWithGravity>,
         ),
     >,
+    mut meshes: ResMut<Assets<Mesh>>,
     build_extenders: Query<
         (&Transform, &ExtendsBuildArea),
         (Without<BuildPreview>, Without<ShieldPreview>),
@@ -1384,7 +1432,7 @@ fn handle_building(
         return;
     };
 
-    let Ok((mut shield_preview_transform, mut shield_preview_visibility)) =
+    let Ok((mut shield_preview_transform, mut shield_preview_visibility, mut shield_preview_mesh)) =
         shield_preview_query.single_mut()
     else {
         return;
@@ -1486,6 +1534,9 @@ fn handle_building(
     if matches!(buildable, Buildable::ShieldGenerator) {
         shield_preview_transform.translation.x = placement_pos.x;
         shield_preview_transform.translation.y = placement_pos.y;
+        // Update mesh to face correct direction for current player
+        let new_mesh = create_shield_mesh(SHIELD_MAX_THICKNESS, game_state.current_player);
+        shield_preview_mesh.0 = meshes.add(new_mesh);
         *shield_preview_visibility = Visibility::Visible;
     } else {
         *shield_preview_visibility = Visibility::Hidden;
@@ -1919,13 +1970,10 @@ fn update_projectiles(
             }
 
             let gen_pos = gen_transform.translation.truncate();
-            // Shield dome is centered at generator position, extends upward
-            // Check if projectile is within the half-dome (above generator base, within radius)
             let rel_pos = pos - gen_pos;
 
-            // Must be above the generator base (y >= 0 relative to generator)
-            // and within the dome radius
-            if rel_pos.y >= 0.0 && rel_pos.length() <= SHIELD_RADIUS {
+            // Check if projectile is within the shield arc
+            if point_in_shield(rel_pos, generator.player) {
                 // Hit the shield!
                 let stats = projectile.weapon.stats();
                 shield_hits.push((gen_entity, stats.damage.max(1.0), pos));
@@ -2884,22 +2932,25 @@ fn update_shield_domes(
     let mut generators_with_domes: std::collections::HashSet<Entity> =
         std::collections::HashSet::new();
 
-    // Update existing domes or despawn if generator gone/disabled/depleted
+    // Update existing domes or despawn if generator gone/disabled/depleted/health changed
     for (dome_entity, dome, mut dome_transform, material_handle) in &mut domes {
         if let Ok((_, gen_transform, generator)) = generators.get(dome.owner) {
             if generator.disabled_turns > 0 || generator.shield_health <= 0.0 {
                 // Shield disabled or depleted - despawn dome
+                commands.entity(dome_entity).despawn();
+            } else if (generator.shield_health - dome.last_health).abs() > 0.01 {
+                // Health changed - despawn and let it respawn with new thickness
                 commands.entity(dome_entity).despawn();
             } else {
                 // Update dome position to follow generator
                 dome_transform.translation.x = gen_transform.translation.x;
                 dome_transform.translation.y = gen_transform.translation.y;
 
-                // Update dome opacity based on health
+                // Update dome color
                 let health_ratio = generator.shield_health / SHIELD_MAX_HEALTH;
                 if let Some(material) = materials.get_mut(&material_handle.0) {
                     let base_color = generator.player.color();
-                    material.color = base_color.with_alpha(0.4 + 0.5 * health_ratio);
+                    material.color = base_color.with_alpha(0.5 + 0.4 * health_ratio);
                 }
 
                 generators_with_domes.insert(dome.owner);
@@ -2919,54 +2970,28 @@ fn update_shield_domes(
             continue;
         }
 
-        // Create a half-circle arc outline for the dome (pointing upward)
-        let segments = 32;
-        let thickness = 3.0;
-        let inner_radius = SHIELD_RADIUS - thickness;
-        let outer_radius = SHIELD_RADIUS;
-
-        let mut vertices = Vec::new();
-        // Create inner and outer vertices for each segment
-        for i in 0..=segments {
-            let angle = std::f32::consts::PI * (i as f32 / segments as f32);
-            let cos_a = angle.cos();
-            let sin_a = angle.sin();
-            // Inner vertex
-            vertices.push([cos_a * inner_radius, sin_a * inner_radius, 0.0]);
-            // Outer vertex
-            vertices.push([cos_a * outer_radius, sin_a * outer_radius, 0.0]);
-        }
-
-        let mut indices = Vec::new();
-        for i in 0..segments {
-            let base = (i * 2) as u32;
-            // Two triangles per segment to form a quad
-            indices.push(base);
-            indices.push(base + 1);
-            indices.push(base + 2);
-            indices.push(base + 1);
-            indices.push(base + 3);
-            indices.push(base + 2);
-        }
-
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
-        mesh.insert_indices(Indices::U32(indices));
-
+        // Calculate thickness based on health
         let health_ratio = generator.shield_health / SHIELD_MAX_HEALTH;
+        let thickness =
+            SHIELD_MIN_THICKNESS + (SHIELD_MAX_THICKNESS - SHIELD_MIN_THICKNESS) * health_ratio;
+
+        let mesh = create_shield_mesh(thickness, generator.player);
         let base_color = generator.player.color();
 
         commands.spawn((
             Mesh2d(meshes.add(mesh)),
             MeshMaterial2d(materials.add(ColorMaterial::from_color(
-                base_color.with_alpha(0.4 + 0.5 * health_ratio),
+                base_color.with_alpha(0.5 + 0.4 * health_ratio),
             ))),
             Transform::from_xyz(
                 transform.translation.x,
                 transform.translation.y,
                 0.9, // Slightly behind structures
             ),
-            ShieldDome { owner: entity },
+            ShieldDome {
+                owner: entity,
+                last_health: generator.shield_health,
+            },
         ));
     }
 }
