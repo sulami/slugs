@@ -310,6 +310,7 @@ struct GameState {
     phase: TurnPhase,
     turn_end_timer: f32,
     winner: Option<Player>,
+    projectiles_seen: bool, // Track if we've seen projectiles this phase (for deferred spawn handling)
 }
 
 impl Default for GameState {
@@ -321,6 +322,7 @@ impl Default for GameState {
             phase: TurnPhase::Aiming,
             turn_end_timer: 0.0,
             winner: None,
+            projectiles_seen: false,
         }
     }
 }
@@ -1638,10 +1640,17 @@ fn check_projectile_phase_end(
         return;
     }
 
+    // Track if we've seen any projectiles (handles deferred spawn)
+    if !projectiles.is_empty() {
+        game_state.projectiles_seen = true;
+    }
+
     // End turn when both projectiles and AA missiles are gone
-    if projectiles.is_empty() && aa_missiles.is_empty() {
+    // but only if we've actually seen projectiles (to handle deferred spawn)
+    if projectiles.is_empty() && aa_missiles.is_empty() && game_state.projectiles_seen {
         game_state.phase = TurnPhase::TurnEnding;
         game_state.turn_end_timer = TURN_END_DELAY;
+        game_state.projectiles_seen = false;
     }
 }
 
