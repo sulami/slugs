@@ -1,10 +1,20 @@
-use bevy::prelude::*;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::prelude::*;
 use rand::RngExt;
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
-const TERRAIN_SEGMENTS: usize = 128;
+
+// World size (larger than window for zooming)
+const WORLD_WIDTH: f32 = 3840.0;
+const WORLD_HEIGHT: f32 = 2160.0;
+const TERRAIN_SEGMENTS: usize = 384;
+
+// Camera settings
+const MIN_ZOOM: f32 = 1.0;
+const MAX_ZOOM: f32 = 4.0;
+const ZOOM_SPEED: f32 = 0.1;
 
 fn main() {
     App::new()
@@ -17,11 +27,21 @@ fn main() {
             ..default()
         }))
         .add_systems(Startup, (setup_camera, generate_terrain))
+        .add_systems(Update, (camera_zoom, camera_pan))
         .run();
 }
 
+#[derive(Component)]
+struct MainCamera;
+
 fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    // Start zoomed out to see the whole world
+    let initial_scale = WORLD_WIDTH / WINDOW_WIDTH as f32;
+    commands.spawn((
+        Camera2d,
+        Transform::from_scale(Vec3::splat(initial_scale)),
+        MainCamera,
+    ));
 }
 
 #[derive(Component)]
@@ -34,20 +54,17 @@ fn generate_terrain(
 ) {
     let mut rng = rand::rng();
 
-    let width = WINDOW_WIDTH as f32;
-    let height = WINDOW_HEIGHT as f32;
-
     // Generate terrain heights using midpoint displacement
     let mut heights = vec![0.0f32; TERRAIN_SEGMENTS + 1];
-    heights[0] = rng.random_range(100.0..300.0);
-    heights[TERRAIN_SEGMENTS] = rng.random_range(100.0..300.0);
+    heights[0] = rng.random_range(200.0..600.0);
+    heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
 
-    midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 150.0, &mut rng);
+    midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
 
     // Build the terrain mesh
-    let segment_width = width / TERRAIN_SEGMENTS as f32;
-    let half_width = width / 2.0;
-    let half_height = height / 2.0;
+    let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
+    let half_width = WORLD_WIDTH / 2.0;
+    let half_height = WORLD_HEIGHT / 2.0;
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -82,6 +99,123 @@ fn generate_terrain(
         MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2)))),
         Terrain,
     ));
+}
+
+fn camera_zoom(
+    mut scroll_events: MessageReader<MouseWheel>,
+    mut camera_query: Query<&mut Transform, With<MainCamera>>,
+    windows: Query<&Window>,
+) {
+    let mut scroll_delta = 0.0;
+
+    for event in scroll_events.read() {
+        scroll_delta += match event.unit {
+            MouseScrollUnit::Line => event.y * ZOOM_SPEED,
+            MouseScrollUnit::Pixel => event.y * ZOOM_SPEED * 0.01,
+        };
+    }
+
+    if scroll_delta == 0.0 {
+        return;
+    }
+
+    let Ok(mut camera_transform) = camera_query.single_mut() else {
+        return;
+    };
+    let Ok(window) = windows.single() else {
+        return;
+    };
+
+    let Some(cursor_position) = window.cursor_position() else {
+        return;
+    };
+
+    // Convert cursor position to world coordinates before zoom
+    let window_size = Vec2::new(window.width(), window.height());
+    let cursor_ndc = (cursor_position - window_size / 2.0) * Vec2::new(1.0, -1.0);
+    let cursor_world_before =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    // Apply zoom
+    let old_scale = camera_transform.scale.x;
+    let max_scale = WORLD_WIDTH / WINDOW_WIDTH as f32; // Zoomed out to see whole world
+    let min_scale = max_scale / MAX_ZOOM;
+
+    let new_scale = (old_scale * (1.0 - scroll_delta)).clamp(min_scale, max_scale);
+    camera_transform.scale = Vec3::splat(new_scale);
+
+    // Convert cursor position to world coordinates after zoom
+    let cursor_world_after =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    // Adjust camera position so cursor stays over the same world point
+    let delta = cursor_world_before - cursor_world_after;
+    camera_transform.translation.x += delta.x;
+    camera_transform.translation.y += delta.y;
+
+    // Clamp camera to world bounds
+    clamp_camera_to_world(&mut camera_transform, window_size);
+}
+
+fn camera_pan(
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    mut camera_query: Query<&mut Transform, With<MainCamera>>,
+    windows: Query<&Window>,
+    mut last_cursor_pos: Local<Option<Vec2>>,
+) {
+    let Ok(mut camera_transform) = camera_query.single_mut() else {
+        return;
+    };
+    let Ok(window) = windows.single() else {
+        return;
+    };
+
+    let Some(cursor_position) = window.cursor_position() else {
+        *last_cursor_pos = None;
+        return;
+    };
+
+    if mouse_button.pressed(MouseButton::Middle) || mouse_button.pressed(MouseButton::Right) {
+        if let Some(last_pos) = *last_cursor_pos {
+            let delta = (cursor_position - last_pos) * Vec2::new(-1.0, 1.0);
+            camera_transform.translation.x += delta.x * camera_transform.scale.x;
+            camera_transform.translation.y += delta.y * camera_transform.scale.x;
+
+            // Clamp camera to world bounds
+            let window_size = Vec2::new(window.width(), window.height());
+            clamp_camera_to_world(&mut camera_transform, window_size);
+        }
+        *last_cursor_pos = Some(cursor_position);
+    } else {
+        *last_cursor_pos = None;
+    }
+}
+
+fn clamp_camera_to_world(camera_transform: &mut Transform, window_size: Vec2) {
+    let half_view_width = window_size.x * camera_transform.scale.x / 2.0;
+    let half_view_height = window_size.y * camera_transform.scale.x / 2.0;
+
+    let half_world_width = WORLD_WIDTH / 2.0;
+    let half_world_height = WORLD_HEIGHT / 2.0;
+
+    // Only clamp if the view is smaller than the world
+    if half_view_width < half_world_width {
+        camera_transform.translation.x = camera_transform.translation.x.clamp(
+            -half_world_width + half_view_width,
+            half_world_width - half_view_width,
+        );
+    } else {
+        camera_transform.translation.x = 0.0;
+    }
+
+    if half_view_height < half_world_height {
+        camera_transform.translation.y = camera_transform.translation.y.clamp(
+            -half_world_height + half_view_height,
+            half_world_height - half_view_height,
+        );
+    } else {
+        camera_transform.translation.y = 0.0;
+    }
 }
 
 fn midpoint_displacement(
