@@ -50,6 +50,7 @@ fn main() {
                 camera_pan,
                 update_turn_indicator,
                 handle_weapon_selection,
+                update_weapon_tooltip,
                 handle_debug_win_button,
                 handle_aiming,
                 update_aim_line,
@@ -60,6 +61,7 @@ fn main() {
             Update,
             (
                 update_projectiles,
+                rebuild_terrain_mesh,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -72,6 +74,7 @@ fn main() {
 #[derive(Resource, Default)]
 struct TerrainData {
     heights: Vec<f32>,
+    needs_rebuild: bool,
 }
 
 impl TerrainData {
@@ -100,6 +103,61 @@ impl TerrainData {
         let height = h0 + (h1 - h0) * t;
 
         Some(height - half_height)
+    }
+
+    fn apply_damage(
+        &mut self,
+        impact_world_x: f32,
+        impact_world_y: f32,
+        _damage: f32,
+        blast_radius: f32,
+    ) {
+        if self.heights.is_empty() {
+            return;
+        }
+
+        let half_width = WORLD_WIDTH / 2.0;
+        let half_height = WORLD_HEIGHT / 2.0;
+        let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
+
+        // Convert impact position to terrain coordinates (heights are stored in terrain space)
+        let impact_terrain_y = impact_world_y + half_height;
+
+        // Calculate which segments are affected by the blast
+        let left_world_x = impact_world_x - blast_radius;
+        let right_world_x = impact_world_x + blast_radius;
+
+        let left_segment = ((left_world_x + half_width) / segment_width)
+            .floor()
+            .max(0.0) as usize;
+        let right_segment = ((right_world_x + half_width) / segment_width)
+            .ceil()
+            .min(TERRAIN_SEGMENTS as f32) as usize;
+
+        // Carve a circular crater - any terrain within the blast circle is destroyed
+        // The crater is centered at the impact point with the given blast_radius
+        for i in left_segment..=right_segment.min(TERRAIN_SEGMENTS) {
+            let segment_world_x = i as f32 * segment_width - half_width;
+            let dx = segment_world_x - impact_world_x;
+
+            // Calculate the crater depth at this x position (circular crater)
+            // For a circle: x² + y² = r², so y = sqrt(r² - x²)
+            let dx_squared = dx * dx;
+            let radius_squared = blast_radius * blast_radius;
+
+            if dx_squared < radius_squared {
+                // This segment is within the horizontal extent of the blast
+                let crater_depth = (radius_squared - dx_squared).sqrt();
+                let crater_floor = impact_terrain_y - crater_depth;
+
+                // If terrain is above the crater floor, carve it down
+                if self.heights[i] > crater_floor {
+                    self.heights[i] = crater_floor.max(0.0);
+                }
+            }
+        }
+
+        self.needs_rebuild = true;
     }
 }
 
@@ -135,6 +193,28 @@ impl Player {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Weapon {
     Artillery,
+}
+
+struct WeaponStats {
+    damage: f32,
+    blast_radius: f32,
+}
+
+impl Weapon {
+    fn stats(&self) -> WeaponStats {
+        match self {
+            Weapon::Artillery => WeaponStats {
+                damage: 10.0,
+                blast_radius: 50.0,
+            },
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Weapon::Artillery => "Artillery",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -199,6 +279,7 @@ struct ChargeIndicatorWorld;
 #[derive(Component)]
 struct Projectile {
     velocity: Vec2,
+    weapon: Weapon,
 }
 
 #[derive(Component)]
@@ -212,6 +293,9 @@ struct NewGameButton;
 
 #[derive(Component)]
 struct ExitButton;
+
+#[derive(Component)]
+struct WeaponTooltip;
 
 fn setup_camera(mut commands: Commands) {
     // Start zoomed out to see the whole world
@@ -256,6 +340,7 @@ fn setup_ui(mut commands: Commands) {
             parent
                 .spawn((
                     Button,
+                    Interaction::None,
                     Node {
                         width: Val::Px(100.0),
                         height: Val::Px(40.0),
@@ -304,6 +389,30 @@ fn setup_ui(mut commands: Commands) {
                     TextColor(Color::srgb(1.0, 1.0, 0.5)),
                 ));
         });
+
+    // Weapon tooltip (hidden by default, positioned near cursor)
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                padding: UiRect::all(Val::Px(8.0)),
+                left: Val::Px(100.0),
+                top: Val::Px(100.0),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.9)),
+            GlobalZIndex(100),
+            WeaponTooltip,
+        ))
+        .with_child((
+            Text::new("Artillery\nDamage: 10\nBlast: 50"),
+            TextFont {
+                font_size: 14.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+        ));
 
     // World-space charge indicator (will be positioned near base during aiming)
     commands.spawn((
@@ -443,6 +552,50 @@ fn handle_weapon_selection(
     }
 }
 
+fn update_weapon_tooltip(
+    weapon_buttons: Query<(&Interaction, &WeaponButton)>,
+    mut tooltip_query: Query<(&mut Node, &Children), With<WeaponTooltip>>,
+    mut text_query: Query<&mut Text>,
+    windows: Query<&Window>,
+) {
+    let Ok((mut node, children)) = tooltip_query.single_mut() else {
+        return;
+    };
+
+    // Find hovered weapon button
+    let hovered = weapon_buttons
+        .iter()
+        .find(|(interaction, _)| **interaction == Interaction::Hovered);
+
+    if let Some((_, weapon_button)) = hovered {
+        let stats = weapon_button.weapon.stats();
+
+        // Update text in child
+        if let Some(child) = children.iter().next() {
+            if let Ok(mut text) = text_query.get_mut(child) {
+                **text = format!(
+                    "{}\nDamage: {}\nBlast Radius: {}",
+                    weapon_button.weapon.name(),
+                    stats.damage,
+                    stats.blast_radius
+                );
+            }
+        }
+
+        // Position tooltip above cursor
+        if let Ok(window) = windows.single() {
+            if let Some(cursor) = window.cursor_position() {
+                node.left = Val::Px(cursor.x + 15.0);
+                node.top = Val::Auto;
+                node.bottom = Val::Px(window.height() - cursor.y + 15.0);
+            }
+        }
+        node.display = Display::Flex;
+    } else {
+        node.display = Display::None;
+    }
+}
+
 fn handle_debug_win_button(
     mut game_state: ResMut<GameState>,
     interaction_query: Query<&Interaction, (Changed<Interaction>, With<DebugWinButton>)>,
@@ -520,6 +673,7 @@ fn handle_aiming(
         // Fire projectile
         let speed = (aiming_state.charge_time / MAX_CHARGE_TIME) * MAX_LAUNCH_SPEED;
         let velocity = aim_direction * speed;
+        let weapon = game_state.selected_weapon.unwrap();
 
         let start = base_pos + Vec2::Y * (PLAYER_BASE_SIZE / 2.0);
         commands.spawn((
@@ -529,7 +683,7 @@ fn handle_aiming(
                 ..default()
             },
             Transform::from_xyz(start.x, start.y, 2.0),
-            Projectile { velocity },
+            Projectile { velocity, weapon },
         ));
 
         aiming_state.charging = false;
@@ -716,7 +870,7 @@ fn update_charge_indicator(
 fn update_projectiles(
     mut commands: Commands,
     mut game_state: ResMut<GameState>,
-    terrain_data: Res<TerrainData>,
+    mut terrain_data: ResMut<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
     player_bases: Query<(&Transform, &PlayerBase), Without<Projectile>>,
@@ -767,13 +921,68 @@ fn update_projectiles(
         // Check terrain collision
         if let Some(terrain_height) = terrain_data.get_height_at(pos.x) {
             if pos.y <= terrain_height {
-                // Hit terrain
+                // Hit terrain - apply damage
+                let stats = projectile.weapon.stats();
+                terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
+
                 commands.entity(entity).despawn();
                 game_state.phase = TurnPhase::TurnEnding;
                 game_state.turn_end_timer = TURN_END_DELAY;
             }
         }
     }
+}
+
+fn rebuild_terrain_mesh(
+    mut terrain_data: ResMut<TerrainData>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    terrain_query: Query<&Mesh2d, With<Terrain>>,
+) {
+    if !terrain_data.needs_rebuild {
+        return;
+    }
+
+    terrain_data.needs_rebuild = false;
+
+    let Ok(mesh_handle) = terrain_query.single() else {
+        return;
+    };
+
+    let Some(mesh) = meshes.get_mut(&mesh_handle.0) else {
+        return;
+    };
+
+    // Rebuild vertices
+    let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
+    let half_width = WORLD_WIDTH / 2.0;
+    let half_height = WORLD_HEIGHT / 2.0;
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    for i in 0..TERRAIN_SEGMENTS {
+        let x0 = i as f32 * segment_width - half_width;
+        let x1 = (i + 1) as f32 * segment_width - half_width;
+        let y0 = terrain_data.heights[i] - half_height;
+        let y1 = terrain_data.heights[i + 1] - half_height;
+        let bottom = -half_height;
+
+        let base = vertices.len() as u32;
+        vertices.push([x0, bottom, 0.0]);
+        vertices.push([x1, bottom, 0.0]);
+        vertices.push([x1, y1, 0.0]);
+        vertices.push([x0, y0, 0.0]);
+
+        indices.push(base);
+        indices.push(base + 1);
+        indices.push(base + 2);
+        indices.push(base);
+        indices.push(base + 2);
+        indices.push(base + 3);
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+    mesh.insert_indices(Indices::U32(indices));
 }
 
 fn check_turn_end(mut game_state: ResMut<GameState>, time: Res<Time>) {
@@ -899,7 +1108,9 @@ fn handle_game_over_buttons(
 
             commands.spawn((
                 Mesh2d(meshes.add(mesh)),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2)))),
+                MeshMaterial2d(
+                    materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2))),
+                ),
                 Terrain,
             ));
 
