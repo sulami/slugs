@@ -79,6 +79,7 @@ fn main() {
             Update,
             (
                 update_projectiles,
+                process_pending_burst_shots,
                 aa_fire_missiles,
                 update_aa_missiles,
                 check_projectile_phase_end,
@@ -231,6 +232,7 @@ enum Weapon {
     ClusterGrenade,
     ClusterSubmunition,
     EMP,
+    Burst,
 }
 
 struct WeaponStats {
@@ -257,6 +259,10 @@ impl Weapon {
                 damage: 0.0,
                 blast_radius: 300.0,
             },
+            Weapon::Burst => WeaponStats {
+                damage: 6.0,
+                blast_radius: 60.0,
+            },
         }
     }
 
@@ -266,12 +272,13 @@ impl Weapon {
             Weapon::ClusterGrenade => "Cluster",
             Weapon::ClusterSubmunition => "Submunition",
             Weapon::EMP => "EMP",
+            Weapon::Burst => "Burst",
         }
     }
 
     fn is_selectable(&self) -> bool {
         match self {
-            Weapon::Artillery | Weapon::ClusterGrenade | Weapon::EMP => true,
+            Weapon::Artillery | Weapon::ClusterGrenade | Weapon::EMP | Weapon::Burst => true,
             Weapon::ClusterSubmunition => false,
         }
     }
@@ -498,6 +505,15 @@ struct PendingExplosion {
     blast_radius: f32,
 }
 
+/// Pending burst shots that fire with a delay
+#[derive(Component)]
+struct PendingBurstShot {
+    delay: f32,
+    velocity: Vec2,
+    start_pos: Vec2,
+    player: Player,
+}
+
 #[derive(Component)]
 struct HealthBarBackground {
     owner: Entity,
@@ -637,6 +653,34 @@ fn setup_ui(
                 ))
                 .with_child((
                     Text::new("EMP"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
+            // Burst button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    WeaponButton {
+                        weapon: Weapon::Burst,
+                    },
+                ))
+                .with_child((
+                    Text::new("Burst"),
                     TextFont {
                         font_size: 16.0,
                         ..default()
@@ -1076,6 +1120,14 @@ fn update_weapon_tooltip(
                 EMP_DISABLE_TURNS,
                 stats.blast_radius
             ))
+        } else if weapon_button.weapon == Weapon::Burst {
+            let stats = weapon_button.weapon.stats();
+            Some(format!(
+                "{}\n3x Projectiles\nDamage: {} each\nBlast Radius: {}",
+                weapon_button.weapon.name(),
+                stats.damage,
+                stats.blast_radius
+            ))
         } else {
             let stats = weapon_button.weapon.stats();
             Some(format!(
@@ -1203,20 +1255,60 @@ fn handle_aiming(
         let weapon = game_state.selected_weapon.unwrap();
 
         let start = base_pos + Vec2::Y * (PLAYER_BASE_SIZE / 2.0);
-        commands.spawn((
-            Sprite {
-                color: game_state.current_player.color(),
-                custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
-                ..default()
-            },
-            Transform::from_xyz(start.x, start.y, 3.0),
-            Projectile {
-                velocity,
-                weapon,
-                prev_velocity_y: velocity.y,
-                player: game_state.current_player,
-            },
-        ));
+
+        if weapon == Weapon::Burst {
+            // Burst fires 3 projectiles sequentially with small random spread
+            let mut rng = rand::rng();
+            for i in 0..3 {
+                let angle_offset: f32 = rng.random_range(-0.02..0.02); // Small random spread
+                let rotated_velocity = Vec2::new(
+                    velocity.x * angle_offset.cos() - velocity.y * angle_offset.sin(),
+                    velocity.x * angle_offset.sin() + velocity.y * angle_offset.cos(),
+                );
+
+                if i == 0 {
+                    // First shot fires immediately
+                    commands.spawn((
+                        Sprite {
+                            color: game_state.current_player.color(),
+                            custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
+                            ..default()
+                        },
+                        Transform::from_xyz(start.x, start.y, 3.0),
+                        Projectile {
+                            velocity: rotated_velocity,
+                            weapon,
+                            prev_velocity_y: rotated_velocity.y,
+                            player: game_state.current_player,
+                        },
+                    ));
+                } else {
+                    // Subsequent shots are delayed
+                    commands.spawn(PendingBurstShot {
+                        delay: i as f32 * 0.3, // 300ms between shots
+                        velocity: rotated_velocity,
+                        start_pos: start,
+                        player: game_state.current_player,
+                    });
+                }
+            }
+        } else {
+            // Normal single projectile
+            commands.spawn((
+                Sprite {
+                    color: game_state.current_player.color(),
+                    custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
+                    ..default()
+                },
+                Transform::from_xyz(start.x, start.y, 3.0),
+                Projectile {
+                    velocity,
+                    weapon,
+                    prev_velocity_y: velocity.y,
+                    player: game_state.current_player,
+                },
+            ));
+        }
 
         // Muzzle flash particles
         spawn_particles(
@@ -2005,6 +2097,7 @@ fn check_projectile_phase_end(
     mut game_state: ResMut<GameState>,
     projectiles: Query<Entity, With<Projectile>>,
     aa_missiles: Query<Entity, With<AAMissile>>,
+    pending_burst_shots: Query<Entity, With<PendingBurstShot>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -2015,9 +2108,13 @@ fn check_projectile_phase_end(
         game_state.projectiles_seen = true;
     }
 
-    // End turn when both projectiles and AA missiles are gone
+    // End turn when projectiles, AA missiles, and pending burst shots are all gone
     // but only if we've actually seen projectiles (to handle deferred spawn)
-    if projectiles.is_empty() && aa_missiles.is_empty() && game_state.projectiles_seen {
+    if projectiles.is_empty()
+        && aa_missiles.is_empty()
+        && pending_burst_shots.is_empty()
+        && game_state.projectiles_seen
+    {
         game_state.phase = TurnPhase::TurnEnding;
         game_state.turn_end_timer = TURN_END_DELAY;
         game_state.projectiles_seen = false;
@@ -2033,6 +2130,53 @@ fn spawn_explosion(commands: &mut Commands, pos: Vec2, damage: f32, blast_radius
             blast_radius,
         },
     ));
+}
+
+fn process_pending_burst_shots(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut pending_shots: Query<(Entity, &mut PendingBurstShot)>,
+) {
+    let dt = time.delta_secs();
+
+    for (entity, mut shot) in &mut pending_shots {
+        shot.delay -= dt;
+
+        if shot.delay <= 0.0 {
+            // Spawn the projectile
+            commands.spawn((
+                Sprite {
+                    color: shot.player.color(),
+                    custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
+                    ..default()
+                },
+                Transform::from_xyz(shot.start_pos.x, shot.start_pos.y, 3.0),
+                Projectile {
+                    velocity: shot.velocity,
+                    weapon: Weapon::Burst,
+                    prev_velocity_y: shot.velocity.y,
+                    player: shot.player,
+                },
+            ));
+
+            // Spawn muzzle flash for this shot
+            spawn_particles(
+                &mut commands,
+                shot.start_pos,
+                8,
+                Color::srgb(1.0, 0.8, 0.3),
+                (40.0, 100.0),
+                0.1,
+                3.0,
+                false,
+                true,
+                Some(shot.velocity.normalize_or_zero()),
+                0.5,
+            );
+
+            commands.entity(entity).despawn();
+        }
+    }
 }
 
 fn process_pending_explosions(
