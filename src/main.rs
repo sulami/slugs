@@ -85,6 +85,7 @@ fn main() {
                 process_pending_explosions,
                 process_pending_emps,
                 update_explosions,
+                update_particles,
                 rebuild_terrain_mesh,
                 update_falling_entities,
                 update_health_bars,
@@ -452,6 +453,16 @@ struct Explosion {
     max_time: f32,
     max_radius: f32,
     is_emp: bool,
+}
+
+/// Simple particle for visual effects
+#[derive(Component)]
+struct Particle {
+    velocity: Vec2,
+    lifetime: f32,
+    max_lifetime: f32,
+    gravity: bool,
+    fade: bool,
 }
 
 /// Marker for pending explosions that need to apply damage
@@ -1099,6 +1110,21 @@ fn handle_aiming(
             },
         ));
 
+        // Muzzle flash particles
+        spawn_particles(
+            &mut commands,
+            start,
+            12,
+            Color::srgb(1.0, 0.8, 0.3),
+            (50.0, 150.0),
+            0.15,
+            4.0,
+            false,
+            true,
+            Some(aim_direction),
+            0.5,
+        );
+
         aiming_state.charging = false;
         aiming_state.charge_time = 0.0;
         game_state.selected_weapon = None;
@@ -1536,6 +1562,8 @@ fn update_projectiles(
     let mut submunitions_to_spawn = Vec::new();
     let mut explosions_to_spawn = Vec::new();
     let mut emps_to_spawn = Vec::new();
+    let mut smoke_particles = Vec::new();
+    let mut cluster_split_positions = Vec::new();
 
     for (entity, mut transform, mut projectile, sprite) in &mut projectiles {
         let prev_vel_y = projectile.prev_velocity_y;
@@ -1548,6 +1576,11 @@ fn update_projectiles(
         transform.translation.y += projectile.velocity.y * dt;
 
         let pos = transform.translation.truncate();
+
+        // Spawn smoke trail (randomly, ~30% chance per frame)
+        if rng.random_range(0.0..1.0) < 0.3 {
+            smoke_particles.push(pos);
+        }
 
         // Check for apoapsis (velocity.y crosses from positive to negative)
         if projectile.weapon == Weapon::ClusterGrenade
@@ -1572,6 +1605,9 @@ fn update_projectiles(
 
                 submunitions_to_spawn.push((pos, rotated_velocity, color));
             }
+
+            // Record split position for particle effect
+            cluster_split_positions.push(pos);
 
             to_despawn.push(entity);
             continue;
@@ -1672,6 +1708,42 @@ fn update_projectiles(
             Transform::from_xyz(pos.x, pos.y, 2.0),
             PendingEMP { blast_radius },
         ));
+    }
+
+    // Spawn smoke trail particles
+    for pos in smoke_particles {
+        commands.spawn((
+            Sprite {
+                color: Color::srgba(0.5, 0.5, 0.5, 0.6),
+                custom_size: Some(Vec2::splat(3.0)),
+                ..default()
+            },
+            Transform::from_xyz(pos.x, pos.y, 2.5),
+            Particle {
+                velocity: Vec2::new(rng.random_range(-10.0..10.0), rng.random_range(5.0..15.0)),
+                lifetime: 0.0,
+                max_lifetime: 0.4,
+                gravity: false,
+                fade: true,
+            },
+        ));
+    }
+
+    // Spawn cluster split effect - burst of sparks radiating outward
+    for pos in cluster_split_positions {
+        spawn_particles(
+            &mut commands,
+            pos,
+            20,
+            Color::srgb(1.0, 0.9, 0.4), // Bright yellow-white sparks
+            (80.0, 200.0),
+            0.3,
+            3.0,
+            true,
+            true,
+            None,  // Radial burst in all directions
+            1.0,
+        );
     }
 }
 
@@ -1856,6 +1928,35 @@ fn process_pending_explosions(
                     is_emp: false,
                 },
             ));
+
+            // Spawn initial explosion particles - fiery burst
+            spawn_particles(
+                &mut commands,
+                pos,
+                25,
+                Color::srgb(1.0, 0.8, 0.2), // Bright yellow-orange
+                (100.0, 250.0),
+                0.4,
+                5.0,
+                true,
+                true,
+                None, // Radial burst
+                1.0,
+            );
+            // Add some darker debris particles
+            spawn_particles(
+                &mut commands,
+                pos,
+                15,
+                Color::srgb(0.4, 0.3, 0.2), // Brown debris
+                (50.0, 150.0),
+                0.6,
+                4.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
         }
 
         // Remove the pending explosion
@@ -1903,6 +2004,21 @@ fn process_pending_emps(
             },
         ));
 
+        // Spawn EMP electric particles - blue/cyan sparks
+        spawn_particles(
+            &mut commands,
+            pos,
+            30,
+            Color::srgb(0.3, 0.7, 1.0), // Electric blue
+            (80.0, 200.0),
+            0.5,
+            4.0,
+            false, // No gravity for electric effect
+            true,
+            None,
+            1.0,
+        );
+
         // Remove the pending EMP
         commands.entity(entity).despawn();
     }
@@ -1919,6 +2035,8 @@ fn update_explosions(
         &MeshMaterial2d<ColorMaterial>,
     )>,
 ) {
+    let mut rng = rand::rng();
+
     for (entity, mut explosion, mut transform, material_handle) in &mut explosions {
         explosion.timer += time.delta_secs();
 
@@ -1929,11 +2047,36 @@ fn update_explosions(
             continue;
         }
 
+        let pos = transform.translation.truncate();
+
         // Expand quickly at first, then slow down
         let size_progress = 1.0 - (1.0 - progress).powi(2);
         // Circle mesh has radius 1.0, so scale equals final radius
         let scale = explosion.max_radius * size_progress;
         transform.scale = Vec3::splat(scale.max(0.1));
+
+        // Spawn rising smoke particles during explosion (more at start, less at end)
+        if !explosion.is_emp && rng.random_range(0.0..1.0) < 0.4 * (1.0 - progress) {
+            let offset = Vec2::new(
+                rng.random_range(-scale..scale) * 0.5,
+                rng.random_range(-scale..scale) * 0.5,
+            );
+            commands.spawn((
+                Sprite {
+                    color: Color::srgba(0.3, 0.3, 0.3, 0.5),
+                    custom_size: Some(Vec2::splat(rng.random_range(4.0..8.0))),
+                    ..default()
+                },
+                Transform::from_xyz(pos.x + offset.x, pos.y + offset.y, 2.6),
+                Particle {
+                    velocity: Vec2::new(rng.random_range(-20.0..20.0), rng.random_range(30.0..60.0)),
+                    lifetime: 0.0,
+                    max_lifetime: rng.random_range(0.5..1.0),
+                    gravity: false,
+                    fade: true,
+                },
+            ));
+        }
 
         // Update color based on explosion type
         if let Some(material) = materials.get_mut(&material_handle.0) {
@@ -1948,6 +2091,83 @@ fn update_explosions(
                 material.color = Color::srgba(1.0, green, 0.0, alpha);
             }
         }
+    }
+}
+
+fn update_particles(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut particles: Query<(Entity, &mut Transform, &mut Particle, &mut Sprite)>,
+) {
+    let dt = time.delta_secs();
+
+    for (entity, mut transform, mut particle, mut sprite) in &mut particles {
+        particle.lifetime += dt;
+
+        if particle.lifetime >= particle.max_lifetime {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        // Apply velocity
+        transform.translation.x += particle.velocity.x * dt;
+        transform.translation.y += particle.velocity.y * dt;
+
+        // Apply gravity if enabled
+        if particle.gravity {
+            particle.velocity.y -= GRAVITY * dt * 0.5;
+        }
+
+        // Fade out if enabled
+        if particle.fade {
+            let progress = particle.lifetime / particle.max_lifetime;
+            let alpha = 1.0 - progress;
+            sprite.color = sprite.color.with_alpha(alpha);
+        }
+    }
+}
+
+fn spawn_particles(
+    commands: &mut Commands,
+    pos: Vec2,
+    count: u32,
+    color: Color,
+    speed_range: (f32, f32),
+    lifetime: f32,
+    size: f32,
+    gravity: bool,
+    fade: bool,
+    direction: Option<Vec2>,
+    spread: f32,
+) {
+    let mut rng = rand::rng();
+
+    for _ in 0..count {
+        let angle = if let Some(dir) = direction {
+            let base_angle = dir.y.atan2(dir.x);
+            base_angle + rng.random_range(-spread..spread)
+        } else {
+            rng.random_range(0.0..std::f32::consts::TAU)
+        };
+
+        let speed = rng.random_range(speed_range.0..speed_range.1);
+        let velocity = Vec2::new(angle.cos(), angle.sin()) * speed;
+
+        commands.spawn((
+            Sprite {
+                color,
+                custom_size: Some(Vec2::splat(size)),
+                ..default()
+            },
+            Transform::from_xyz(pos.x, pos.y, 3.5),
+            Particle {
+                velocity,
+                lifetime: 0.0,
+                max_lifetime: lifetime * rng.random_range(0.8..1.2),
+                gravity,
+                fade,
+            },
+        ));
     }
 }
 
@@ -2099,6 +2319,25 @@ fn update_aa_missiles(
 
         // Update rotation to face direction of travel
         transform.rotation = Quat::from_rotation_z(new_angle - std::f32::consts::FRAC_PI_2);
+
+        // Spawn flame trail particle behind the missile
+        let flame_offset = -new_direction * 8.0;
+        let flame_pos = pos + flame_offset;
+        commands.spawn((
+            Sprite {
+                color: Color::srgb(1.0, 0.6, 0.1),
+                custom_size: Some(Vec2::splat(5.0)),
+                ..default()
+            },
+            Transform::from_xyz(flame_pos.x, flame_pos.y, 2.8),
+            Particle {
+                velocity: -new_direction * 30.0 + Vec2::new(0.0, 10.0),
+                lifetime: 0.0,
+                max_lifetime: 0.2,
+                gravity: false,
+                fade: true,
+            },
+        ));
 
         // Check if exceeded max range
         if missile.distance_traveled > AA_MISSILE_MAX_RANGE {
@@ -2419,22 +2658,80 @@ fn check_base_destruction(mut game_state: ResMut<GameState>, bases: Query<(&Play
 
 fn check_structure_destruction(
     mut commands: Commands,
-    aa_launchers: Query<(Entity, &Health), (With<AALauncher>, Without<Wall>)>,
-    walls: Query<(Entity, &Health), (With<Wall>, Without<AALauncher>)>,
+    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<Wall>)>,
+    walls: Query<(Entity, &Transform, &Sprite, &Health), (With<Wall>, Without<AALauncher>)>,
     health_bars: Query<(Entity, &HealthBar)>,
     health_bar_backgrounds: Query<(Entity, &HealthBarBackground)>,
 ) {
     // Check AA launchers
-    for (entity, health) in &aa_launchers {
+    for (entity, transform, health) in &aa_launchers {
         if health.is_dead() {
+            let pos = transform.translation.truncate();
+            // Spawn destruction debris
+            spawn_particles(
+                &mut commands,
+                pos,
+                20,
+                Color::srgb(0.5, 0.5, 0.5), // Gray metal debris
+                (60.0, 150.0),
+                0.8,
+                5.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
+            spawn_particles(
+                &mut commands,
+                pos,
+                10,
+                Color::srgb(1.0, 0.6, 0.2), // Sparks
+                (80.0, 180.0),
+                0.4,
+                3.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
             commands.entity(entity).despawn();
             despawn_health_bar(&mut commands, entity, &health_bars, &health_bar_backgrounds);
         }
     }
 
     // Check walls
-    for (entity, health) in &walls {
+    for (entity, transform, sprite, health) in &walls {
         if health.is_dead() {
+            let pos = transform.translation.truncate();
+            let size = sprite.custom_size.unwrap_or(Vec2::splat(40.0));
+            // Spawn destruction debris - more particles for larger structures
+            let particle_count = ((size.x * size.y) / 200.0) as u32;
+            spawn_particles(
+                &mut commands,
+                pos,
+                particle_count.max(15),
+                Color::srgb(0.6, 0.5, 0.4), // Brown/tan debris
+                (50.0, 120.0),
+                1.0,
+                6.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
+            spawn_particles(
+                &mut commands,
+                pos,
+                particle_count / 2,
+                Color::srgb(0.4, 0.35, 0.3), // Darker debris
+                (30.0, 80.0),
+                1.2,
+                4.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
             commands.entity(entity).despawn();
             despawn_health_bar(&mut commands, entity, &health_bars, &health_bar_backgrounds);
         }
