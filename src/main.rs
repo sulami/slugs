@@ -33,6 +33,9 @@ const TICK_MARK_SIZE: f32 = 15.0;
 // Terrain settings
 const GROUND_DAMAGE_RESISTANCE: f32 = 2.0;
 
+// Building settings
+const BUILD_RADIUS: f32 = 200.0;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -54,9 +57,12 @@ fn main() {
                 camera_pan,
                 update_turn_indicator,
                 handle_weapon_selection,
+                handle_buildable_selection,
                 update_weapon_tooltip,
                 handle_debug_win_button,
                 handle_aiming,
+                handle_building,
+                draw_buildable_area,
                 update_aim_line,
                 update_charge_indicator,
             ),
@@ -70,6 +76,7 @@ fn main() {
                 update_falling_bases,
                 update_health_bars,
                 check_base_destruction,
+                check_aa_destruction,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -247,10 +254,36 @@ impl Weapon {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Buildable {
+    AALauncher,
+}
+
+impl Buildable {
+    fn name(&self) -> &'static str {
+        match self {
+            Buildable::AALauncher => "AA Launcher",
+        }
+    }
+
+    fn health(&self) -> f32 {
+        match self {
+            Buildable::AALauncher => 3.0,
+        }
+    }
+
+    fn size(&self) -> f32 {
+        match self {
+            Buildable::AALauncher => 30.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum TurnPhase {
     #[default]
     Aiming,
+    Building,
     ProjectileInFlight,
     TurnEnding,
     GameOver,
@@ -260,6 +293,7 @@ enum TurnPhase {
 struct GameState {
     current_player: Player,
     selected_weapon: Option<Weapon>,
+    selected_buildable: Option<Buildable>,
     phase: TurnPhase,
     turn_end_timer: f32,
     winner: Option<Player>,
@@ -270,6 +304,7 @@ impl Default for GameState {
         Self {
             current_player: Player::Blue,
             selected_weapon: None,
+            selected_buildable: None,
             phase: TurnPhase::Aiming,
             turn_end_timer: 0.0,
             winner: None,
@@ -326,6 +361,22 @@ struct TurnIndicator;
 #[derive(Component)]
 struct WeaponButton {
     weapon: Weapon,
+}
+
+#[derive(Component)]
+struct BuildableButton {
+    buildable: Buildable,
+}
+
+#[derive(Component)]
+struct BuildPreview;
+
+#[derive(Component)]
+struct BuildableAreaOverlay;
+
+#[derive(Component)]
+struct AALauncher {
+    player: Player,
 }
 
 #[derive(Component)]
@@ -462,6 +513,34 @@ fn setup_ui(mut commands: Commands) {
                     TextColor(Color::WHITE),
                 ));
 
+            // AA Launcher button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    BuildableButton {
+                        buildable: Buildable::AALauncher,
+                    },
+                ))
+                .with_child((
+                    Text::new("AA"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
             // Debug win button
             parent
                 .spawn((
@@ -523,6 +602,30 @@ fn setup_ui(mut commands: Commands) {
         Transform::from_xyz(0.0, 0.0, 10.0),
         Visibility::Hidden,
         ChargeIndicatorWorld,
+    ));
+
+    // Build preview (follows cursor when buildable is selected)
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+            custom_size: Some(Vec2::splat(30.0)),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 0.0, 3.0),
+        Visibility::Hidden,
+        BuildPreview,
+    ));
+
+    // Buildable area overlay (shown when buildable is selected)
+    commands.spawn((
+        Sprite {
+            color: Color::srgba(0.0, 0.0, 0.0, 0.0), // Will be drawn via gizmos instead
+            custom_size: Some(Vec2::ZERO),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 0.0, 0.5),
+        Visibility::Hidden,
+        BuildableAreaOverlay,
     ));
 
     // Game over overlay (hidden by default)
@@ -645,6 +748,7 @@ fn handle_weapon_selection(
                 game_state.selected_weapon = None;
             } else {
                 game_state.selected_weapon = Some(weapon_button.weapon);
+                game_state.selected_buildable = None; // Deselect buildable
             }
         }
     }
@@ -652,6 +756,47 @@ fn handle_weapon_selection(
     // Update button visuals
     for (interaction, weapon_button, mut border_color, mut bg_color) in &mut button_query {
         let is_selected = game_state.selected_weapon == Some(weapon_button.weapon);
+        let is_hovered = *interaction == Interaction::Hovered;
+
+        // Border: yellow if selected, white otherwise
+        if is_selected {
+            *border_color = BorderColor::all(Color::srgb(1.0, 1.0, 0.0));
+        } else {
+            *border_color = BorderColor::all(Color::WHITE);
+        }
+
+        // Background: combine selected and hovered states
+        let base = if is_selected { 0.4 } else { 0.3 };
+        let brightness = if is_hovered { base + 0.15 } else { base };
+        *bg_color = BackgroundColor(Color::srgb(brightness, brightness, brightness));
+    }
+}
+
+fn handle_buildable_selection(
+    mut game_state: ResMut<GameState>,
+    interaction_query: Query<(&Interaction, &BuildableButton), Changed<Interaction>>,
+    mut button_query: Query<(
+        &Interaction,
+        &BuildableButton,
+        &mut BorderColor,
+        &mut BackgroundColor,
+    )>,
+) {
+    // Handle clicks - toggle selection
+    for (interaction, buildable_button) in &interaction_query {
+        if *interaction == Interaction::Pressed {
+            if game_state.selected_buildable == Some(buildable_button.buildable) {
+                game_state.selected_buildable = None;
+            } else {
+                game_state.selected_buildable = Some(buildable_button.buildable);
+                game_state.selected_weapon = None; // Deselect weapon
+            }
+        }
+    }
+
+    // Update button visuals
+    for (interaction, buildable_button, mut border_color, mut bg_color) in &mut button_query {
+        let is_selected = game_state.selected_buildable == Some(buildable_button.buildable);
         let is_hovered = *interaction == Interaction::Hovered;
 
         // Border: yellow if selected, white otherwise
@@ -820,6 +965,194 @@ fn handle_aiming(
         aiming_state.charge_time = 0.0;
         game_state.selected_weapon = None;
         game_state.phase = TurnPhase::ProjectileInFlight;
+    }
+}
+
+fn handle_building(
+    mut commands: Commands,
+    mut game_state: ResMut<GameState>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    camera_query: Query<&Transform, With<MainCamera>>,
+    terrain_data: Res<TerrainData>,
+    interaction_query: Query<&Interaction, With<Button>>,
+    mut preview_query: Query<
+        (&mut Transform, &mut Visibility, &mut Sprite),
+        (With<BuildPreview>, Without<MainCamera>, Without<PlayerBase>, Without<AALauncher>),
+    >,
+    player_bases: Query<(&Transform, &PlayerBase), (Without<BuildPreview>, Without<MainCamera>, Without<AALauncher>)>,
+    aa_launchers: Query<(&Transform, &AALauncher), (Without<BuildPreview>, Without<MainCamera>, Without<PlayerBase>)>,
+) {
+    let Ok((mut preview_transform, mut preview_visibility, mut preview_sprite)) =
+        preview_query.single_mut()
+    else {
+        return;
+    };
+
+    // Hide preview if not in aiming phase or no buildable selected
+    if game_state.phase != TurnPhase::Aiming || game_state.selected_buildable.is_none() {
+        *preview_visibility = Visibility::Hidden;
+        return;
+    }
+
+    let buildable = game_state.selected_buildable.unwrap();
+
+    let Ok(window) = windows.single() else {
+        *preview_visibility = Visibility::Hidden;
+        return;
+    };
+    let Ok(camera_transform) = camera_query.single() else {
+        *preview_visibility = Visibility::Hidden;
+        return;
+    };
+
+    let Some(cursor_position) = window.cursor_position() else {
+        *preview_visibility = Visibility::Hidden;
+        return;
+    };
+
+    // Convert cursor to world position
+    let window_size = Vec2::new(window.width(), window.height());
+    let cursor_ndc = (cursor_position - window_size / 2.0) * Vec2::new(1.0, -1.0);
+    let cursor_world =
+        camera_transform.translation.truncate() + cursor_ndc * camera_transform.scale.x;
+
+    // Snap to terrain height
+    let terrain_y = terrain_data
+        .get_height_at(cursor_world.x)
+        .unwrap_or(cursor_world.y);
+    let placement_pos = Vec2::new(cursor_world.x, terrain_y + buildable.size() / 2.0);
+
+    // Collect friendly structure positions for build radius check
+    let friendly_positions: Vec<Vec2> = player_bases
+        .iter()
+        .filter(|(_, base)| base.player == game_state.current_player)
+        .map(|(t, _)| t.translation.truncate())
+        .chain(
+            aa_launchers
+                .iter()
+                .filter(|(_, aa)| aa.player == game_state.current_player)
+                .map(|(t, _)| t.translation.truncate()),
+        )
+        .collect();
+
+    // Check if placement is within build radius of any friendly structure
+    let is_valid_placement = friendly_positions
+        .iter()
+        .any(|pos| pos.distance(placement_pos) <= BUILD_RADIUS);
+
+    // Update preview
+    preview_transform.translation.x = placement_pos.x;
+    preview_transform.translation.y = placement_pos.y;
+    preview_sprite.custom_size = Some(Vec2::splat(buildable.size()));
+
+    // Color based on valid/invalid placement
+    if is_valid_placement {
+        // Green tint for valid
+        preview_sprite.color = Color::srgba(0.2, 0.8, 0.2, 0.6);
+    } else {
+        // Red tint for invalid
+        preview_sprite.color = Color::srgba(0.8, 0.2, 0.2, 0.6);
+    }
+    *preview_visibility = Visibility::Visible;
+
+    // Don't place if clicking on UI
+    let clicking_ui = interaction_query.iter().any(|i| *i != Interaction::None);
+
+    // Handle placement (only if valid)
+    if mouse_button.just_pressed(MouseButton::Left) && !clicking_ui && is_valid_placement {
+        let health_bar_y = placement_pos.y - buildable.size() / 2.0 - 20.0;
+
+        // Spawn the actual structure
+        let aa_entity = commands
+            .spawn((
+                Sprite {
+                    color: game_state.current_player.color(),
+                    custom_size: Some(Vec2::splat(buildable.size())),
+                    ..default()
+                },
+                Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
+                AALauncher {
+                    player: game_state.current_player,
+                },
+                Health::new(buildable.health()),
+            ))
+            .id();
+
+        // Health bar background
+        commands.spawn((
+            Sprite {
+                color: Color::srgba(0.0, 0.0, 0.0, 0.5),
+                custom_size: Some(Vec2::new(40.0, 28.0)),
+                ..default()
+            },
+            Transform::from_xyz(placement_pos.x, health_bar_y, 4.0),
+            HealthBarBackground { owner: aa_entity },
+        ));
+
+        // Health bar text
+        commands.spawn((
+            Text2d::new(format!("{}", buildable.health() as i32)),
+            TextFont {
+                font_size: 32.0,
+                ..default()
+            },
+            TextColor(game_state.current_player.color()),
+            Transform::from_xyz(placement_pos.x, health_bar_y, 5.0),
+            HealthBar { owner: aa_entity },
+        ));
+
+        // End turn
+        game_state.selected_buildable = None;
+        game_state.phase = TurnPhase::TurnEnding;
+        game_state.turn_end_timer = TURN_END_DELAY;
+        *preview_visibility = Visibility::Hidden;
+    }
+}
+
+fn draw_buildable_area(
+    mut gizmos: Gizmos,
+    game_state: Res<GameState>,
+    player_bases: Query<(&Transform, &PlayerBase), Without<AALauncher>>,
+    aa_launchers: Query<(&Transform, &AALauncher), Without<PlayerBase>>,
+) {
+    // Only show when a buildable is selected
+    if game_state.phase != TurnPhase::Aiming || game_state.selected_buildable.is_none() {
+        return;
+    }
+
+    // Collect friendly structure positions
+    let friendly_positions: Vec<Vec2> = player_bases
+        .iter()
+        .filter(|(_, base)| base.player == game_state.current_player)
+        .map(|(t, _)| t.translation.truncate())
+        .chain(
+            aa_launchers
+                .iter()
+                .filter(|(_, aa)| aa.player == game_state.current_player)
+                .map(|(t, _)| t.translation.truncate()),
+        )
+        .collect();
+
+    // Draw filled circles for each friendly structure's build radius
+    // Using multiple concentric circles to create a filled effect
+    let player_color = game_state.current_player.color().to_srgba();
+    let fill_color = Color::srgba(player_color.red, player_color.green, player_color.blue, 0.15);
+
+    for pos in &friendly_positions {
+        // Draw filled area using concentric circles
+        let num_rings = 20;
+        for i in 0..num_rings {
+            let radius = BUILD_RADIUS * (i as f32 + 1.0) / num_rings as f32;
+            gizmos.circle_2d(*pos, radius, fill_color);
+        }
+
+        // Draw outer edge
+        gizmos.circle_2d(
+            *pos,
+            BUILD_RADIUS,
+            Color::srgba(player_color.red, player_color.green, player_color.blue, 0.5),
+        );
     }
 }
 
@@ -1006,7 +1339,14 @@ fn update_projectiles(
     mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Sprite)>,
-    mut player_bases: Query<(Entity, &Transform, &PlayerBase, &mut Health), Without<Projectile>>,
+    mut player_bases: Query<
+        (Entity, &Transform, &PlayerBase, &mut Health),
+        (Without<Projectile>, Without<AALauncher>),
+    >,
+    mut aa_launchers: Query<
+        (Entity, &Transform, &AALauncher, &mut Health),
+        (Without<Projectile>, Without<PlayerBase>),
+    >,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -1113,6 +1453,26 @@ fn update_projectiles(
                         health.take_damage(stats.damage);
                     } else if distance < stats.blast_radius {
                         // Damage falls off linearly with distance from edge of base
+                        let damage_factor = 1.0 - (distance / stats.blast_radius);
+                        let damage = stats.damage * damage_factor;
+                        health.take_damage(damage);
+                    }
+                }
+
+                // Apply blast damage to all AA launchers within blast radius
+                for (_, aa_transform, _, mut health) in &mut aa_launchers {
+                    let aa_pos = aa_transform.translation.truncate();
+                    let half_size = Buildable::AALauncher.size() / 2.0;
+
+                    // Calculate distance to nearest point on the AA launcher
+                    let nearest_x = pos.x.clamp(aa_pos.x - half_size, aa_pos.x + half_size);
+                    let nearest_y = pos.y.clamp(aa_pos.y - half_size, aa_pos.y + half_size);
+                    let nearest_point = Vec2::new(nearest_x, nearest_y);
+                    let distance = pos.distance(nearest_point);
+
+                    if distance <= 0.0 {
+                        health.take_damage(stats.damage);
+                    } else if distance < stats.blast_radius {
                         let damage_factor = 1.0 - (distance / stats.blast_radius);
                         let damage = stats.damage * damage_factor;
                         health.take_damage(damage);
@@ -1293,36 +1653,55 @@ fn update_falling_bases(
 }
 
 fn update_health_bars(
-    bases: Query<(Entity, &Transform, &Health), With<PlayerBase>>,
+    bases: Query<(Entity, &Transform, &Health), (With<PlayerBase>, Without<AALauncher>)>,
+    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<PlayerBase>)>,
     mut health_bars: Query<
         (&mut Text2d, &mut Transform, &HealthBar),
-        (Without<PlayerBase>, Without<HealthBarBackground>),
+        (Without<PlayerBase>, Without<HealthBarBackground>, Without<AALauncher>),
     >,
     mut health_bar_backgrounds: Query<
         (&mut Transform, &HealthBarBackground),
-        (Without<PlayerBase>, Without<HealthBar>),
+        (Without<PlayerBase>, Without<HealthBar>, Without<AALauncher>),
     >,
 ) {
     for (mut text, mut bar_transform, health_bar) in &mut health_bars {
-        // Find the owner base
-        if let Some((_, base_transform, health)) =
-            bases.iter().find(|(e, _, _)| *e == health_bar.owner)
+        // Find the owner (base or AA launcher)
+        if let Some((_, owner_transform, health, size)) = bases
+            .iter()
+            .find(|(e, _, _)| *e == health_bar.owner)
+            .map(|(e, t, h)| (e, t, h, PLAYER_BASE_SIZE))
+            .or_else(|| {
+                aa_launchers
+                    .iter()
+                    .find(|(e, _, _)| *e == health_bar.owner)
+                    .map(|(e, t, h)| (e, t, h, Buildable::AALauncher.size()))
+            })
         {
             // Update text
             **text = format!("{}", health.current.ceil() as i32);
 
-            // Position below the base
-            let health_bar_y = base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
-            bar_transform.translation.x = base_transform.translation.x;
+            // Position below the structure
+            let health_bar_y = owner_transform.translation.y - size / 2.0 - 20.0;
+            bar_transform.translation.x = owner_transform.translation.x;
             bar_transform.translation.y = health_bar_y;
         }
     }
 
     // Update background positions
     for (mut bg_transform, bg) in &mut health_bar_backgrounds {
-        if let Some((_, base_transform, _)) = bases.iter().find(|(e, _, _)| *e == bg.owner) {
-            let health_bar_y = base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
-            bg_transform.translation.x = base_transform.translation.x;
+        if let Some((_, owner_transform, size)) = bases
+            .iter()
+            .find(|(e, _, _)| *e == bg.owner)
+            .map(|(_, t, _)| ((), t, PLAYER_BASE_SIZE))
+            .or_else(|| {
+                aa_launchers
+                    .iter()
+                    .find(|(e, _, _)| *e == bg.owner)
+                    .map(|(_, t, _)| ((), t, Buildable::AALauncher.size()))
+            })
+        {
+            let health_bar_y = owner_transform.translation.y - size / 2.0 - 20.0;
+            bg_transform.translation.x = owner_transform.translation.x;
             bg_transform.translation.y = health_bar_y;
         }
     }
@@ -1340,6 +1719,34 @@ fn check_base_destruction(mut game_state: ResMut<GameState>, bases: Query<(&Play
             game_state.winner = Some(player_base.player.next());
             game_state.phase = TurnPhase::GameOver;
             return;
+        }
+    }
+}
+
+fn check_aa_destruction(
+    mut commands: Commands,
+    aa_launchers: Query<(Entity, &Health), With<AALauncher>>,
+    health_bars: Query<(Entity, &HealthBar)>,
+    health_bar_backgrounds: Query<(Entity, &HealthBarBackground)>,
+) {
+    for (entity, health) in &aa_launchers {
+        if health.is_dead() {
+            // Despawn the AA launcher
+            commands.entity(entity).despawn();
+
+            // Despawn associated health bar
+            for (bar_entity, bar) in &health_bars {
+                if bar.owner == entity {
+                    commands.entity(bar_entity).despawn();
+                }
+            }
+
+            // Despawn associated health bar background
+            for (bg_entity, bg) in &health_bar_backgrounds {
+                if bg.owner == entity {
+                    commands.entity(bg_entity).despawn();
+                }
+            }
         }
     }
 }
