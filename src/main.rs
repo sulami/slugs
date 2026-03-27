@@ -93,6 +93,7 @@ fn main() {
                 check_structure_destruction,
                 reset_aa_launchers,
                 decrement_aa_disabled,
+                update_shield_domes.after(decrement_aa_disabled),
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -280,6 +281,7 @@ impl Weapon {
 enum Buildable {
     AALauncher,
     Wall,
+    ShieldGenerator,
 }
 
 impl Buildable {
@@ -287,6 +289,7 @@ impl Buildable {
         match self {
             Buildable::AALauncher => "AA Launcher",
             Buildable::Wall => "Wall",
+            Buildable::ShieldGenerator => "Shield Generator",
         }
     }
 
@@ -294,6 +297,7 @@ impl Buildable {
         match self {
             Buildable::AALauncher => 3.0,
             Buildable::Wall => 8.0,
+            Buildable::ShieldGenerator => 4.0,
         }
     }
 
@@ -301,6 +305,7 @@ impl Buildable {
         match self {
             Buildable::AALauncher => 30.0,
             Buildable::Wall => 40.0,
+            Buildable::ShieldGenerator => 30.0,
         }
     }
 }
@@ -402,6 +407,9 @@ struct BuildableButton {
 struct BuildPreview;
 
 #[derive(Component)]
+struct ShieldPreview;
+
+#[derive(Component)]
 struct BuildableAreaOverlay;
 
 #[derive(Component)]
@@ -419,6 +427,23 @@ struct FallsWithGravity {
 
 #[derive(Component)]
 struct Wall;
+
+const SHIELD_RADIUS: f32 = 100.0;
+const SHIELD_MAX_HEALTH: f32 = 10.0;
+const SHIELD_RECHARGE_PER_TURN: f32 = 3.0;
+
+#[derive(Component)]
+struct ShieldGenerator {
+    player: Player,
+    shield_health: f32,
+    disabled_turns: u32,
+}
+
+/// Visual entity for the shield dome
+#[derive(Component)]
+struct ShieldDome {
+    owner: Entity,
+}
 
 /// Marker for structures that extend the buildable area for a player
 #[derive(Component)]
@@ -445,6 +470,7 @@ struct Projectile {
     velocity: Vec2,
     weapon: Weapon,
     prev_velocity_y: f32, // For apoapsis detection
+    player: Player,
 }
 
 #[derive(Component)]
@@ -501,7 +527,11 @@ fn setup_camera(mut commands: Commands) {
     ));
 }
 
-fn setup_ui(mut commands: Commands) {
+fn setup_ui(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
     // Turn indicator
     commands.spawn((
         Text::new("Blue's Turn"),
@@ -669,6 +699,34 @@ fn setup_ui(mut commands: Commands) {
                     },
                     TextColor(Color::WHITE),
                 ));
+
+            // Shield button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    BuildableButton {
+                        buildable: Buildable::ShieldGenerator,
+                    },
+                ))
+                .with_child((
+                    Text::new("Shield"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
         });
 
     // Weapon tooltip (hidden by default, positioned near cursor)
@@ -719,6 +777,48 @@ fn setup_ui(mut commands: Commands) {
         Visibility::Hidden,
         BuildPreview,
     ));
+
+    // Shield preview arc (shown when placing shield generator)
+    {
+        let segments = 32;
+        let thickness = 3.0;
+        let inner_radius = SHIELD_RADIUS - thickness;
+        let outer_radius = SHIELD_RADIUS;
+
+        let mut vertices = Vec::new();
+        for i in 0..=segments {
+            let angle = std::f32::consts::PI * (i as f32 / segments as f32);
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            vertices.push([cos_a * inner_radius, sin_a * inner_radius, 0.0]);
+            vertices.push([cos_a * outer_radius, sin_a * outer_radius, 0.0]);
+        }
+
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let base = (i * 2) as u32;
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+            indices.push(base + 1);
+            indices.push(base + 3);
+            indices.push(base + 2);
+        }
+
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+        mesh.insert_indices(Indices::U32(indices));
+
+        commands.spawn((
+            Mesh2d(meshes.add(mesh)),
+            MeshMaterial2d(
+                materials.add(ColorMaterial::from_color(Color::srgba(0.5, 0.5, 0.5, 0.4))),
+            ),
+            Transform::from_xyz(0.0, 0.0, 2.9),
+            Visibility::Hidden,
+            ShieldPreview,
+        ));
+    }
 
     // Buildable area overlay (shown when buildable is selected)
     commands.spawn((
@@ -996,6 +1096,13 @@ fn update_weapon_tooltip(
                 "Wall\nHealth: {}\nDefensive barrier that\nblocks projectiles",
                 Buildable::Wall.health() as i32
             )),
+            Buildable::ShieldGenerator => Some(format!(
+                "Shield Generator\nHealth: {}\nShield: {} (recharges {}/ turn)\nRadius: {}\nProjects protective dome\nthat absorbs damage",
+                Buildable::ShieldGenerator.health() as i32,
+                SHIELD_MAX_HEALTH as i32,
+                SHIELD_RECHARGE_PER_TURN as i32,
+                SHIELD_RADIUS as i32
+            )),
         }
     } else {
         None
@@ -1107,6 +1214,7 @@ fn handle_aiming(
                 velocity,
                 weapon,
                 prev_velocity_y: velocity.y,
+                player: game_state.current_player,
             },
         ));
 
@@ -1148,10 +1256,35 @@ fn handle_building(
             Without<MainCamera>,
             Without<PlayerBase>,
             Without<AALauncher>,
+            Without<ShieldPreview>,
+            Without<ExtendsBuildArea>,
+            Without<FallsWithGravity>,
         ),
     >,
-    build_extenders: Query<(&Transform, &ExtendsBuildArea), Without<BuildPreview>>,
-    structures: Query<(&Transform, &Sprite), (With<FallsWithGravity>, Without<BuildPreview>)>,
+    mut shield_preview_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ShieldPreview>,
+            Without<BuildPreview>,
+            Without<MainCamera>,
+            Without<PlayerBase>,
+            Without<AALauncher>,
+            Without<ExtendsBuildArea>,
+            Without<FallsWithGravity>,
+        ),
+    >,
+    build_extenders: Query<
+        (&Transform, &ExtendsBuildArea),
+        (Without<BuildPreview>, Without<ShieldPreview>),
+    >,
+    structures: Query<
+        (&Transform, &Sprite),
+        (
+            With<FallsWithGravity>,
+            Without<BuildPreview>,
+            Without<ShieldPreview>,
+        ),
+    >,
 ) {
     let Ok((mut preview_transform, mut preview_visibility, mut preview_sprite)) =
         preview_query.single_mut()
@@ -1159,8 +1292,15 @@ fn handle_building(
         return;
     };
 
+    let Ok((mut shield_preview_transform, mut shield_preview_visibility)) =
+        shield_preview_query.single_mut()
+    else {
+        return;
+    };
+
     // Hide preview if not in aiming phase or no buildable selected
     if game_state.phase != TurnPhase::Aiming || game_state.selected_buildable.is_none() {
+        *shield_preview_visibility = Visibility::Hidden;
         *preview_visibility = Visibility::Hidden;
         return;
     }
@@ -1250,6 +1390,15 @@ fn handle_building(
         );
     }
 
+    // Show shield dome preview when placing shield generator
+    if matches!(buildable, Buildable::ShieldGenerator) {
+        shield_preview_transform.translation.x = placement_pos.x;
+        shield_preview_transform.translation.y = placement_pos.y;
+        *shield_preview_visibility = Visibility::Visible;
+    } else {
+        *shield_preview_visibility = Visibility::Hidden;
+    }
+
     // Don't place if clicking on UI
     let clicking_ui = interaction_query.iter().any(|i| *i != Interaction::None);
 
@@ -1299,6 +1448,31 @@ fn handle_building(
                     },
                 ))
                 .id(),
+            Buildable::ShieldGenerator => {
+                let generator_entity = commands
+                    .spawn((
+                        Sprite {
+                            color: game_state.current_player.color(),
+                            custom_size: Some(Vec2::splat(buildable.size())),
+                            ..default()
+                        },
+                        Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
+                        ShieldGenerator {
+                            player: game_state.current_player,
+                            shield_health: SHIELD_MAX_HEALTH,
+                            disabled_turns: 0,
+                        },
+                        Health::new(buildable.health()),
+                        FallsWithGravity {
+                            size: buildable.size(),
+                        },
+                        ExtendsBuildArea {
+                            player: game_state.current_player,
+                        },
+                    ))
+                    .id();
+                generator_entity
+            }
         };
 
         // Health bar background
@@ -1546,8 +1720,25 @@ fn update_projectiles(
     terrain_data: Res<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Sprite)>,
-    player_bases: Query<&Transform, (With<PlayerBase>, Without<Projectile>, Without<Wall>)>,
-    walls: Query<(&Transform, &Sprite), (With<Wall>, Without<Projectile>, Without<PlayerBase>)>,
+    player_bases: Query<
+        &Transform,
+        (
+            With<PlayerBase>,
+            Without<Projectile>,
+            Without<Wall>,
+            Without<ShieldGenerator>,
+        ),
+    >,
+    walls: Query<
+        (&Transform, &Sprite),
+        (
+            With<Wall>,
+            Without<Projectile>,
+            Without<PlayerBase>,
+            Without<ShieldGenerator>,
+        ),
+    >,
+    mut shield_generators: Query<(Entity, &Transform, &mut ShieldGenerator), Without<Projectile>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -1559,11 +1750,12 @@ fn update_projectiles(
 
     // Collect entities to despawn and submunitions to spawn (to avoid borrow issues)
     let mut to_despawn = Vec::new();
-    let mut submunitions_to_spawn = Vec::new();
+    let mut submunitions_to_spawn: Vec<(Vec2, Vec2, Color, Player)> = Vec::new();
     let mut explosions_to_spawn = Vec::new();
     let mut emps_to_spawn = Vec::new();
     let mut smoke_particles = Vec::new();
     let mut cluster_split_positions = Vec::new();
+    let mut shield_hits: Vec<(Entity, f32, Vec2)> = Vec::new(); // (generator_entity, damage, hit_pos)
 
     for (entity, mut transform, mut projectile, sprite) in &mut projectiles {
         let prev_vel_y = projectile.prev_velocity_y;
@@ -1603,7 +1795,7 @@ fn update_projectiles(
                     base_velocity.x * total_offset.sin() + base_velocity.y * total_offset.cos(),
                 ) * speed_variation;
 
-                submunitions_to_spawn.push((pos, rotated_velocity, color));
+                submunitions_to_spawn.push((pos, rotated_velocity, color, projectile.player));
             }
 
             // Record split position for particle effect
@@ -1619,6 +1811,60 @@ fn update_projectiles(
         // Check world bounds
         if pos.x < -half_width || pos.x > half_width {
             to_despawn.push(entity);
+            continue;
+        }
+
+        // Check shield collision first (shields protect structures behind them)
+        let mut hit_shield = false;
+        for (gen_entity, gen_transform, generator) in &shield_generators {
+            // Skip friendly shields (projectiles pass through own team's shields)
+            if generator.player == projectile.player {
+                continue;
+            }
+            // Skip disabled or depleted shields
+            if generator.disabled_turns > 0 || generator.shield_health <= 0.0 {
+                continue;
+            }
+
+            let gen_pos = gen_transform.translation.truncate();
+            // Shield dome is centered at generator position, extends upward
+            // Check if projectile is within the half-dome (above generator base, within radius)
+            let rel_pos = pos - gen_pos;
+
+            // Must be above the generator base (y >= 0 relative to generator)
+            // and within the dome radius
+            if rel_pos.y >= 0.0 && rel_pos.length() <= SHIELD_RADIUS {
+                // Hit the shield!
+                let stats = projectile.weapon.stats();
+                shield_hits.push((gen_entity, stats.damage.max(1.0), pos));
+                hit_shield = true;
+
+                // Spawn impact particles
+                spawn_particles(
+                    &mut commands,
+                    pos,
+                    8,
+                    generator.player.color(),
+                    (30.0, 80.0),
+                    0.3,
+                    3.0,
+                    false,
+                    true,
+                    None,
+                    1.0,
+                );
+
+                // EMP still triggers its effect when hitting shield
+                if projectile.weapon == Weapon::EMP {
+                    emps_to_spawn.push((pos, stats.blast_radius));
+                }
+
+                to_despawn.push(entity);
+                break;
+            }
+        }
+
+        if hit_shield {
             continue;
         }
 
@@ -1675,13 +1921,20 @@ fn update_projectiles(
         }
     }
 
+    // Apply shield damage
+    for (gen_entity, damage, _hit_pos) in shield_hits {
+        if let Ok((_, _, mut generator)) = shield_generators.get_mut(gen_entity) {
+            generator.shield_health = (generator.shield_health - damage).max(0.0);
+        }
+    }
+
     // Despawn projectiles
     for entity in to_despawn {
         commands.entity(entity).despawn();
     }
 
     // Spawn submunitions
-    for (pos, velocity, color) in submunitions_to_spawn {
+    for (pos, velocity, color, player) in submunitions_to_spawn {
         commands.spawn((
             Sprite {
                 color,
@@ -1693,6 +1946,7 @@ fn update_projectiles(
                 velocity,
                 weapon: Weapon::ClusterSubmunition,
                 prev_velocity_y: velocity.y,
+                player,
             },
         ));
     }
@@ -1741,7 +1995,7 @@ fn update_projectiles(
             3.0,
             true,
             true,
-            None,  // Radial burst in all directions
+            None, // Radial burst in all directions
             1.0,
         );
     }
@@ -1972,7 +2226,11 @@ fn process_pending_emps(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     pending: Query<(Entity, &Transform, &PendingEMP)>,
-    mut aa_launchers: Query<(&Transform, &mut AALauncher, &mut Sprite)>,
+    mut aa_launchers: Query<(&Transform, &mut AALauncher, &mut Sprite), Without<ShieldGenerator>>,
+    mut shield_generators: Query<
+        (&Transform, &mut ShieldGenerator, &mut Sprite),
+        Without<AALauncher>,
+    >,
 ) {
     for (entity, transform, emp) in &pending {
         let pos = transform.translation.truncate();
@@ -1986,6 +2244,18 @@ fn process_pending_emps(
                 aa_launcher.disabled_turns = EMP_DISABLE_TURNS;
                 // Visual indicator - darken the sprite
                 aa_sprite.color = Color::srgb(0.3, 0.3, 0.3);
+            }
+        }
+
+        // Disable shield generators in blast radius
+        for (gen_transform, mut generator, mut gen_sprite) in &mut shield_generators {
+            let gen_pos = gen_transform.translation.truncate();
+            let distance = pos.distance(gen_pos);
+
+            if distance < emp.blast_radius {
+                generator.disabled_turns = EMP_DISABLE_TURNS;
+                // Visual indicator - darken the sprite
+                gen_sprite.color = Color::srgb(0.3, 0.3, 0.3);
             }
         }
 
@@ -2069,7 +2339,10 @@ fn update_explosions(
                 },
                 Transform::from_xyz(pos.x + offset.x, pos.y + offset.y, 2.6),
                 Particle {
-                    velocity: Vec2::new(rng.random_range(-20.0..20.0), rng.random_range(30.0..60.0)),
+                    velocity: Vec2::new(
+                        rng.random_range(-20.0..20.0),
+                        rng.random_range(30.0..60.0),
+                    ),
                     lifetime: 0.0,
                     max_lifetime: rng.random_range(0.5..1.0),
                     gravity: false,
@@ -2407,7 +2680,8 @@ fn reset_aa_launchers(mut game_state: ResMut<GameState>, mut aa_launchers: Query
 
 fn decrement_aa_disabled(
     mut game_state: ResMut<GameState>,
-    mut aa_launchers: Query<(&mut AALauncher, &mut Sprite)>,
+    mut aa_launchers: Query<(&mut AALauncher, &mut Sprite), Without<ShieldGenerator>>,
+    mut shield_generators: Query<(&mut ShieldGenerator, &mut Sprite), Without<AALauncher>>,
 ) {
     // Only run once at the start of each turn
     if game_state.phase != TurnPhase::Aiming || game_state.turn_start_processed {
@@ -2425,8 +2699,132 @@ fn decrement_aa_disabled(
         }
     }
 
+    // Handle shield generator disabled countdown and recharge
+    for (mut generator, mut sprite) in &mut shield_generators {
+        if generator.disabled_turns > 0 {
+            generator.disabled_turns -= 1;
+
+            // Restore color when no longer disabled
+            if generator.disabled_turns == 0 {
+                sprite.color = generator.player.color();
+            }
+        }
+
+        // Recharge shield when not disabled
+        if generator.disabled_turns == 0 && generator.shield_health < SHIELD_MAX_HEALTH {
+            generator.shield_health =
+                (generator.shield_health + SHIELD_RECHARGE_PER_TURN).min(SHIELD_MAX_HEALTH);
+        }
+    }
+
     // Mark turn start as processed
     game_state.turn_start_processed = true;
+}
+
+fn update_shield_domes(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    generators: Query<(Entity, &Transform, &ShieldGenerator)>,
+    mut domes: Query<
+        (
+            Entity,
+            &ShieldDome,
+            &mut Transform,
+            &MeshMaterial2d<ColorMaterial>,
+        ),
+        Without<ShieldGenerator>,
+    >,
+) {
+    // Track which generators have domes
+    let mut generators_with_domes: std::collections::HashSet<Entity> =
+        std::collections::HashSet::new();
+
+    // Update existing domes or despawn if generator gone/disabled/depleted
+    for (dome_entity, dome, mut dome_transform, material_handle) in &mut domes {
+        if let Ok((_, gen_transform, generator)) = generators.get(dome.owner) {
+            if generator.disabled_turns > 0 || generator.shield_health <= 0.0 {
+                // Shield disabled or depleted - despawn dome
+                commands.entity(dome_entity).despawn();
+            } else {
+                // Update dome position to follow generator
+                dome_transform.translation.x = gen_transform.translation.x;
+                dome_transform.translation.y = gen_transform.translation.y;
+
+                // Update dome opacity based on health
+                let health_ratio = generator.shield_health / SHIELD_MAX_HEALTH;
+                if let Some(material) = materials.get_mut(&material_handle.0) {
+                    let base_color = generator.player.color();
+                    material.color = base_color.with_alpha(0.4 + 0.5 * health_ratio);
+                }
+
+                generators_with_domes.insert(dome.owner);
+            }
+        } else {
+            // Generator no longer exists
+            commands.entity(dome_entity).despawn();
+        }
+    }
+
+    // Spawn domes for generators that don't have them
+    for (entity, transform, generator) in &generators {
+        if generators_with_domes.contains(&entity) {
+            continue;
+        }
+        if generator.disabled_turns > 0 || generator.shield_health <= 0.0 {
+            continue;
+        }
+
+        // Create a half-circle arc outline for the dome (pointing upward)
+        let segments = 32;
+        let thickness = 3.0;
+        let inner_radius = SHIELD_RADIUS - thickness;
+        let outer_radius = SHIELD_RADIUS;
+
+        let mut vertices = Vec::new();
+        // Create inner and outer vertices for each segment
+        for i in 0..=segments {
+            let angle = std::f32::consts::PI * (i as f32 / segments as f32);
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            // Inner vertex
+            vertices.push([cos_a * inner_radius, sin_a * inner_radius, 0.0]);
+            // Outer vertex
+            vertices.push([cos_a * outer_radius, sin_a * outer_radius, 0.0]);
+        }
+
+        let mut indices = Vec::new();
+        for i in 0..segments {
+            let base = (i * 2) as u32;
+            // Two triangles per segment to form a quad
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+            indices.push(base + 1);
+            indices.push(base + 3);
+            indices.push(base + 2);
+        }
+
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
+        mesh.insert_indices(Indices::U32(indices));
+
+        let health_ratio = generator.shield_health / SHIELD_MAX_HEALTH;
+        let base_color = generator.player.color();
+
+        commands.spawn((
+            Mesh2d(meshes.add(mesh)),
+            MeshMaterial2d(materials.add(ColorMaterial::from_color(
+                base_color.with_alpha(0.4 + 0.5 * health_ratio),
+            ))),
+            Transform::from_xyz(
+                transform.translation.x,
+                transform.translation.y,
+                0.9, // Slightly behind structures
+            ),
+            ShieldDome { owner: entity },
+        ));
+    }
 }
 
 fn rebuild_terrain_mesh(
@@ -2550,15 +2948,39 @@ fn update_falling_entities(
 fn update_health_bars(
     bases: Query<
         (Entity, &Transform, &Health),
-        (With<PlayerBase>, Without<AALauncher>, Without<Wall>),
+        (
+            With<PlayerBase>,
+            Without<AALauncher>,
+            Without<Wall>,
+            Without<ShieldGenerator>,
+        ),
     >,
     aa_launchers: Query<
         (Entity, &Transform, &Health),
-        (With<AALauncher>, Without<PlayerBase>, Without<Wall>),
+        (
+            With<AALauncher>,
+            Without<PlayerBase>,
+            Without<Wall>,
+            Without<ShieldGenerator>,
+        ),
     >,
     walls: Query<
         (Entity, &Transform, &Sprite, &Health),
-        (With<Wall>, Without<PlayerBase>, Without<AALauncher>),
+        (
+            With<Wall>,
+            Without<PlayerBase>,
+            Without<AALauncher>,
+            Without<ShieldGenerator>,
+        ),
+    >,
+    shield_generators: Query<
+        (Entity, &Transform, &Health),
+        (
+            With<ShieldGenerator>,
+            Without<PlayerBase>,
+            Without<AALauncher>,
+            Without<Wall>,
+        ),
     >,
     mut health_bars: Query<
         (&mut Text2d, &mut Transform, &HealthBar),
@@ -2567,6 +2989,7 @@ fn update_health_bars(
             Without<HealthBarBackground>,
             Without<AALauncher>,
             Without<Wall>,
+            Without<ShieldGenerator>,
         ),
     >,
     mut health_bar_backgrounds: Query<
@@ -2576,11 +2999,12 @@ fn update_health_bars(
             Without<HealthBar>,
             Without<AALauncher>,
             Without<Wall>,
+            Without<ShieldGenerator>,
         ),
     >,
 ) {
     for (mut text, mut bar_transform, health_bar) in &mut health_bars {
-        // Find the owner (base, AA launcher, or wall)
+        // Find the owner (base, AA launcher, wall, or shield generator)
         if let Some((_, owner_transform, health, size)) = bases
             .iter()
             .find(|(e, _, _)| *e == health_bar.owner)
@@ -2599,6 +3023,12 @@ fn update_health_bars(
                         let size = sprite.custom_size.unwrap_or(Vec2::splat(40.0)).y;
                         (e, t, h, size)
                     })
+            })
+            .or_else(|| {
+                shield_generators
+                    .iter()
+                    .find(|(e, _, _)| *e == health_bar.owner)
+                    .map(|(e, t, h)| (e, t, h, Buildable::ShieldGenerator.size()))
             })
         {
             // Update text
@@ -2632,6 +3062,12 @@ fn update_health_bars(
                         ((), t, size)
                     })
             })
+            .or_else(|| {
+                shield_generators
+                    .iter()
+                    .find(|(e, _, _)| *e == bg.owner)
+                    .map(|(_, t, _)| ((), t, Buildable::ShieldGenerator.size()))
+            })
         {
             let health_bar_y = owner_transform.translation.y - size / 2.0 - 20.0;
             bg_transform.translation.x = owner_transform.translation.x;
@@ -2658,8 +3094,18 @@ fn check_base_destruction(mut game_state: ResMut<GameState>, bases: Query<(&Play
 
 fn check_structure_destruction(
     mut commands: Commands,
-    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<Wall>)>,
-    walls: Query<(Entity, &Transform, &Sprite, &Health), (With<Wall>, Without<AALauncher>)>,
+    aa_launchers: Query<
+        (Entity, &Transform, &Health),
+        (With<AALauncher>, Without<Wall>, Without<ShieldGenerator>),
+    >,
+    walls: Query<
+        (Entity, &Transform, &Sprite, &Health),
+        (With<Wall>, Without<AALauncher>, Without<ShieldGenerator>),
+    >,
+    shield_generators: Query<
+        (Entity, &Transform, &Health),
+        (With<ShieldGenerator>, Without<AALauncher>, Without<Wall>),
+    >,
     health_bars: Query<(Entity, &HealthBar)>,
     health_bar_backgrounds: Query<(Entity, &HealthBarBackground)>,
 ) {
@@ -2728,6 +3174,42 @@ fn check_structure_destruction(
                 1.2,
                 4.0,
                 true,
+                true,
+                None,
+                1.0,
+            );
+            commands.entity(entity).despawn();
+            despawn_health_bar(&mut commands, entity, &health_bars, &health_bar_backgrounds);
+        }
+    }
+
+    // Check shield generators
+    for (entity, transform, health) in &shield_generators {
+        if health.is_dead() {
+            let pos = transform.translation.truncate();
+            // Spawn destruction debris - electric sparks and metal
+            spawn_particles(
+                &mut commands,
+                pos,
+                15,
+                Color::srgb(0.5, 0.5, 0.6), // Gray-blue metal debris
+                (60.0, 140.0),
+                0.8,
+                5.0,
+                true,
+                true,
+                None,
+                1.0,
+            );
+            spawn_particles(
+                &mut commands,
+                pos,
+                12,
+                Color::srgb(0.3, 0.7, 1.0), // Electric blue sparks
+                (80.0, 160.0),
+                0.5,
+                3.0,
+                false, // No gravity for electric sparks
                 true,
                 None,
                 1.0,
