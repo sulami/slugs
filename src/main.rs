@@ -345,6 +345,11 @@ struct Explosion {
     max_radius: f32,
 }
 
+#[derive(Component)]
+struct HealthBarBackground {
+    owner: Entity,
+}
+
 const EXPLOSION_DURATION: f32 = 0.4;
 
 #[derive(Component)]
@@ -626,7 +631,12 @@ fn update_turn_indicator(
 fn handle_weapon_selection(
     mut game_state: ResMut<GameState>,
     interaction_query: Query<(&Interaction, &WeaponButton), Changed<Interaction>>,
-    mut button_query: Query<(&Interaction, &WeaponButton, &mut BorderColor, &mut BackgroundColor)>,
+    mut button_query: Query<(
+        &Interaction,
+        &WeaponButton,
+        &mut BorderColor,
+        &mut BackgroundColor,
+    )>,
 ) {
     // Handle clicks - toggle selection
     for (interaction, weapon_button) in &interaction_query {
@@ -798,7 +808,7 @@ fn handle_aiming(
                 custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 2.0)),
                 ..default()
             },
-            Transform::from_xyz(start.x, start.y, 2.0),
+            Transform::from_xyz(start.x, start.y, 3.0),
             Projectile {
                 velocity,
                 weapon,
@@ -1111,10 +1121,10 @@ fn update_projectiles(
                 // Spawn explosion
                 commands.spawn((
                     Mesh2d(meshes.add(Circle::new(1.0))),
-                    MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(
-                        1.0, 0.6, 0.0, 1.0,
-                    )))),
-                    Transform::from_xyz(pos.x, pos.y, 2.0),
+                    MeshMaterial2d(
+                        materials.add(ColorMaterial::from_color(Color::srgba(1.0, 0.6, 0.0, 1.0))),
+                    ),
+                    Transform::from_xyz(pos.x, pos.y, 2.0), // Behind health bars
                     Explosion {
                         timer: 0.0,
                         max_time: EXPLOSION_DURATION,
@@ -1145,7 +1155,7 @@ fn update_projectiles(
                 custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 1.5)), // Slightly smaller
                 ..default()
             },
-            Transform::from_xyz(pos.x, pos.y, 2.0),
+            Transform::from_xyz(pos.x, pos.y, 3.0),
             Projectile {
                 velocity,
                 weapon: Weapon::ClusterSubmunition,
@@ -1167,7 +1177,12 @@ fn update_explosions(
     mut commands: Commands,
     time: Res<Time>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut explosions: Query<(Entity, &mut Explosion, &mut Transform, &MeshMaterial2d<ColorMaterial>)>,
+    mut explosions: Query<(
+        Entity,
+        &mut Explosion,
+        &mut Transform,
+        &MeshMaterial2d<ColorMaterial>,
+    )>,
 ) {
     for (entity, mut explosion, mut transform, material_handle) in &mut explosions {
         explosion.timer += time.delta_secs();
@@ -1278,7 +1293,14 @@ fn update_falling_bases(
 
 fn update_health_bars(
     bases: Query<(Entity, &Transform, &Health), With<PlayerBase>>,
-    mut health_bars: Query<(&mut Text2d, &mut Transform, &HealthBar), Without<PlayerBase>>,
+    mut health_bars: Query<
+        (&mut Text2d, &mut Transform, &HealthBar),
+        (Without<PlayerBase>, Without<HealthBarBackground>),
+    >,
+    mut health_bar_backgrounds: Query<
+        (&mut Transform, &HealthBarBackground),
+        (Without<PlayerBase>, Without<HealthBar>),
+    >,
 ) {
     for (mut text, mut bar_transform, health_bar) in &mut health_bars {
         // Find the owner base
@@ -1289,9 +1311,18 @@ fn update_health_bars(
             **text = format!("{}", health.current.ceil() as i32);
 
             // Position below the base
+            let health_bar_y = base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
             bar_transform.translation.x = base_transform.translation.x;
-            bar_transform.translation.y =
-                base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
+            bar_transform.translation.y = health_bar_y;
+        }
+    }
+
+    // Update background positions
+    for (mut bg_transform, bg) in &mut health_bar_backgrounds {
+        if let Some((_, base_transform, _)) = bases.iter().find(|(e, _, _)| *e == bg.owner) {
+            let health_bar_y = base_transform.translation.y - PLAYER_BASE_SIZE / 2.0 - 25.0;
+            bg_transform.translation.x = base_transform.translation.x;
+            bg_transform.translation.y = health_bar_y;
         }
     }
 }
@@ -1366,6 +1397,7 @@ fn handle_game_over_buttons(
     base_query: Query<Entity, With<PlayerBase>>,
     projectile_query: Query<Entity, With<Projectile>>,
     health_bar_query: Query<Entity, With<HealthBar>>,
+    health_bar_bg_query: Query<Entity, With<HealthBarBackground>>,
     explosion_query: Query<Entity, With<Explosion>>,
 ) {
     // Handle exit button
@@ -1394,12 +1426,20 @@ fn handle_game_over_buttons(
             for entity in health_bar_query.iter() {
                 commands.entity(entity).despawn();
             }
+            for entity in health_bar_bg_query.iter() {
+                commands.entity(entity).despawn();
+            }
             for entity in explosion_query.iter() {
                 commands.entity(entity).despawn();
             }
 
             // Generate new world
-            spawn_world(&mut commands, &mut meshes, &mut materials, &mut terrain_data);
+            spawn_world(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut terrain_data,
+            );
         }
     }
 }
@@ -1410,7 +1450,12 @@ fn generate_terrain(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut terrain_data: ResMut<TerrainData>,
 ) {
-    spawn_world(&mut commands, &mut meshes, &mut materials, &mut terrain_data);
+    spawn_world(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut terrain_data,
+    );
 }
 
 fn spawn_world(
@@ -1423,7 +1468,7 @@ fn spawn_world(
     terrain_data.heights = heights.clone();
 
     spawn_terrain_mesh(commands, meshes, materials, &heights);
-    spawn_player_bases(commands, &heights);
+    spawn_player_bases(commands, meshes, materials, &heights);
 }
 
 fn generate_terrain_heights() -> Vec<f32> {
@@ -1480,7 +1525,12 @@ fn spawn_terrain_mesh(
     ));
 }
 
-fn spawn_player_bases(commands: &mut Commands, heights: &[f32]) {
+fn spawn_player_bases(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    heights: &[f32],
+) {
     let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
     let half_width = WORLD_WIDTH / 2.0;
     let half_height = WORLD_HEIGHT / 2.0;
@@ -1489,6 +1539,7 @@ fn spawn_player_bases(commands: &mut Commands, heights: &[f32]) {
         let segment = TERRAIN_SEGMENTS * segment_percent / 100;
         let x = segment as f32 * segment_width - half_width;
         let y = heights[segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+        let health_bar_y = y - PLAYER_BASE_SIZE / 2.0 - 25.0;
 
         let base_entity = commands
             .spawn((
@@ -1503,6 +1554,17 @@ fn spawn_player_bases(commands: &mut Commands, heights: &[f32]) {
             ))
             .id();
 
+        // Health bar background
+        commands.spawn((
+            Mesh2d(meshes.add(Rectangle::new(60.0, 40.0))),
+            MeshMaterial2d(
+                materials.add(ColorMaterial::from_color(Color::srgba(0.0, 0.0, 0.0, 0.5))),
+            ),
+            Transform::from_xyz(x, health_bar_y, 4.0),
+            HealthBarBackground { owner: base_entity },
+        ));
+
+        // Health bar text
         commands.spawn((
             Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
             TextFont {
@@ -1510,7 +1572,7 @@ fn spawn_player_bases(commands: &mut Commands, heights: &[f32]) {
                 ..default()
             },
             TextColor(player.color()),
-            Transform::from_xyz(x, y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+            Transform::from_xyz(x, health_bar_y, 5.0),
             HealthBar { owner: base_entity },
         ));
     }
