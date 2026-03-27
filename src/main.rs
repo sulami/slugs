@@ -88,7 +88,7 @@ fn main() {
                 update_falling_entities,
                 update_health_bars,
                 check_base_destruction,
-                check_aa_destruction,
+                check_structure_destruction,
                 reset_aa_launchers,
                 check_turn_end,
                 update_game_over_overlay,
@@ -270,24 +270,28 @@ impl Weapon {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Buildable {
     AALauncher,
+    Wall,
 }
 
 impl Buildable {
     fn name(&self) -> &'static str {
         match self {
             Buildable::AALauncher => "AA Launcher",
+            Buildable::Wall => "Wall",
         }
     }
 
     fn health(&self) -> f32 {
         match self {
             Buildable::AALauncher => 3.0,
+            Buildable::Wall => 8.0,
         }
     }
 
     fn size(&self) -> f32 {
         match self {
             Buildable::AALauncher => 30.0,
+            Buildable::Wall => 40.0,
         }
     }
 }
@@ -399,6 +403,15 @@ struct AALauncher {
 #[derive(Component)]
 struct FallsWithGravity {
     size: f32, // Used to calculate bottom of entity
+}
+
+#[derive(Component)]
+struct Wall;
+
+/// Marker for structures that extend the buildable area for a player
+#[derive(Component)]
+struct ExtendsBuildArea {
+    player: Player,
 }
 
 #[derive(Component)]
@@ -567,6 +580,34 @@ fn setup_ui(mut commands: Commands) {
                 ))
                 .with_child((
                     Text::new("AA"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
+            // Wall button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    BuildableButton {
+                        buildable: Buildable::Wall,
+                    },
+                ))
+                .with_child((
+                    Text::new("Wall"),
                     TextFont {
                         font_size: 16.0,
                         ..default()
@@ -889,6 +930,10 @@ fn update_weapon_tooltip(
                 Buildable::AALauncher.health() as i32,
                 AA_DETECTION_RANGE as i32
             )),
+            Buildable::Wall => Some(format!(
+                "Wall\nHealth: {}\nDefensive barrier that\nblocks projectiles",
+                Buildable::Wall.health() as i32
+            )),
         }
     } else {
         None
@@ -1023,22 +1068,7 @@ fn handle_building(
             Without<AALauncher>,
         ),
     >,
-    player_bases: Query<
-        (&Transform, &PlayerBase),
-        (
-            Without<BuildPreview>,
-            Without<MainCamera>,
-            Without<AALauncher>,
-        ),
-    >,
-    aa_launchers: Query<
-        (&Transform, &AALauncher),
-        (
-            Without<BuildPreview>,
-            Without<MainCamera>,
-            Without<PlayerBase>,
-        ),
-    >,
+    build_extenders: Query<(&Transform, &ExtendsBuildArea), Without<BuildPreview>>,
 ) {
     let Ok((mut preview_transform, mut preview_visibility, mut preview_sprite)) =
         preview_query.single_mut()
@@ -1081,16 +1111,10 @@ fn handle_building(
     let placement_pos = Vec2::new(cursor_world.x, terrain_y + buildable.size() / 2.0);
 
     // Collect friendly structure positions for build radius check
-    let friendly_positions: Vec<Vec2> = player_bases
+    let friendly_positions: Vec<Vec2> = build_extenders
         .iter()
-        .filter(|(_, base)| base.player == game_state.current_player)
+        .filter(|(_, ext)| ext.player == game_state.current_player)
         .map(|(t, _)| t.translation.truncate())
-        .chain(
-            aa_launchers
-                .iter()
-                .filter(|(_, aa)| aa.player == game_state.current_player)
-                .map(|(t, _)| t.translation.truncate()),
-        )
         .collect();
 
     // Check if placement is within build radius of any friendly structure
@@ -1099,9 +1123,13 @@ fn handle_building(
         .any(|pos| pos.distance(placement_pos) <= BUILD_RADIUS);
 
     // Update preview
+    let preview_size = match buildable {
+        Buildable::Wall => Vec2::new(buildable.size(), buildable.size() * 1.5),
+        _ => Vec2::splat(buildable.size()),
+    };
     preview_transform.translation.x = placement_pos.x;
     preview_transform.translation.y = placement_pos.y;
-    preview_sprite.custom_size = Some(Vec2::splat(buildable.size()));
+    preview_sprite.custom_size = Some(preview_size);
 
     // Color based on valid/invalid placement
     if is_valid_placement {
@@ -1129,23 +1157,48 @@ fn handle_building(
     if mouse_button.just_pressed(MouseButton::Left) && !clicking_ui && is_valid_placement {
         let health_bar_y = placement_pos.y - buildable.size() / 2.0 - 20.0;
 
-        // Spawn the actual structure
-        let aa_entity = commands
-            .spawn((
-                Sprite {
-                    color: game_state.current_player.color(),
-                    custom_size: Some(Vec2::splat(buildable.size())),
-                    ..default()
-                },
-                Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
-                AALauncher {
-                    player: game_state.current_player,
-                    fired_this_turn: false,
-                },
-                Health::new(buildable.health()),
-                FallsWithGravity { size: buildable.size() },
-            ))
-            .id();
+        // Spawn the structure based on type
+        let structure_entity = match buildable {
+            Buildable::AALauncher => commands
+                .spawn((
+                    Sprite {
+                        color: game_state.current_player.color(),
+                        custom_size: Some(Vec2::splat(buildable.size())),
+                        ..default()
+                    },
+                    Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
+                    AALauncher {
+                        player: game_state.current_player,
+                        fired_this_turn: false,
+                    },
+                    Health::new(buildable.health()),
+                    FallsWithGravity {
+                        size: buildable.size(),
+                    },
+                    ExtendsBuildArea {
+                        player: game_state.current_player,
+                    },
+                ))
+                .id(),
+            Buildable::Wall => commands
+                .spawn((
+                    Sprite {
+                        color: game_state.current_player.color(),
+                        custom_size: Some(Vec2::new(buildable.size(), buildable.size() * 1.5)),
+                        ..default()
+                    },
+                    Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
+                    Wall,
+                    Health::new(buildable.health()),
+                    FallsWithGravity {
+                        size: buildable.size() * 1.5,
+                    },
+                    ExtendsBuildArea {
+                        player: game_state.current_player,
+                    },
+                ))
+                .id(),
+        };
 
         // Health bar background
         commands.spawn((
@@ -1155,7 +1208,9 @@ fn handle_building(
                 ..default()
             },
             Transform::from_xyz(placement_pos.x, health_bar_y, 4.0),
-            HealthBarBackground { owner: aa_entity },
+            HealthBarBackground {
+                owner: structure_entity,
+            },
         ));
 
         // Health bar text
@@ -1167,7 +1222,9 @@ fn handle_building(
             },
             TextColor(game_state.current_player.color()),
             Transform::from_xyz(placement_pos.x, health_bar_y, 5.0),
-            HealthBar { owner: aa_entity },
+            HealthBar {
+                owner: structure_entity,
+            },
         ));
 
         // End turn
@@ -1181,8 +1238,7 @@ fn handle_building(
 fn draw_buildable_area(
     mut gizmos: Gizmos,
     game_state: Res<GameState>,
-    player_bases: Query<(&Transform, &PlayerBase), Without<AALauncher>>,
-    aa_launchers: Query<(&Transform, &AALauncher), Without<PlayerBase>>,
+    build_extenders: Query<(&Transform, &ExtendsBuildArea)>,
 ) {
     // Only show when a buildable is selected
     if game_state.phase != TurnPhase::Aiming || game_state.selected_buildable.is_none() {
@@ -1190,16 +1246,10 @@ fn draw_buildable_area(
     }
 
     // Collect friendly structure positions
-    let friendly_positions: Vec<Vec2> = player_bases
+    let friendly_positions: Vec<Vec2> = build_extenders
         .iter()
-        .filter(|(_, base)| base.player == game_state.current_player)
+        .filter(|(_, ext)| ext.player == game_state.current_player)
         .map(|(t, _)| t.translation.truncate())
-        .chain(
-            aa_launchers
-                .iter()
-                .filter(|(_, aa)| aa.player == game_state.current_player)
-                .map(|(t, _)| t.translation.truncate()),
-        )
         .collect();
 
     // Draw filled circles for each friendly structure's build radius
@@ -1410,7 +1460,8 @@ fn update_projectiles(
     terrain_data: Res<TerrainData>,
     time: Res<Time>,
     mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Sprite)>,
-    player_bases: Query<&Transform, (With<PlayerBase>, Without<Projectile>)>,
+    player_bases: Query<&Transform, (With<PlayerBase>, Without<Projectile>, Without<Wall>)>,
+    walls: Query<(&Transform, &Sprite), (With<Wall>, Without<Projectile>, Without<PlayerBase>)>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
         return;
@@ -1475,7 +1526,7 @@ fn update_projectiles(
         }
 
         // Check direct base collision (projectile hits base directly)
-        let mut hit_base_directly = false;
+        let mut hit_structure = false;
         for base_transform in &player_bases {
             let base_pos = base_transform.translation.truncate();
             let half_size = PLAYER_BASE_SIZE / 2.0;
@@ -1485,8 +1536,27 @@ fn update_projectiles(
                 && pos.y >= base_pos.y - half_size
                 && pos.y <= base_pos.y + half_size
             {
-                hit_base_directly = true;
+                hit_structure = true;
                 break;
+            }
+        }
+
+        // Check wall collision
+        if !hit_structure {
+            for (wall_transform, wall_sprite) in &walls {
+                let wall_pos = wall_transform.translation.truncate();
+                let wall_size = wall_sprite.custom_size.unwrap_or(Vec2::splat(40.0));
+                let half_w = wall_size.x / 2.0;
+                let half_h = wall_size.y / 2.0;
+
+                if pos.x >= wall_pos.x - half_w
+                    && pos.x <= wall_pos.x + half_w
+                    && pos.y >= wall_pos.y - half_h
+                    && pos.y <= wall_pos.y + half_h
+                {
+                    hit_structure = true;
+                    break;
+                }
             }
         }
 
@@ -1496,7 +1566,7 @@ fn update_projectiles(
             .map(|h| pos.y <= h)
             .unwrap_or(false);
 
-        if hit_base_directly || terrain_hit {
+        if hit_structure || terrain_hit {
             let stats = projectile.weapon.stats();
             if stats.blast_radius > 0.0 {
                 explosions_to_spawn.push((pos, stats.damage, stats.blast_radius));
@@ -1575,11 +1645,15 @@ fn process_pending_explosions(
     pending: Query<(Entity, &Transform, &PendingExplosion)>,
     mut player_bases: Query<
         (&Transform, &mut Health),
-        (With<PlayerBase>, Without<PendingExplosion>, Without<AALauncher>),
+        (With<PlayerBase>, Without<PendingExplosion>, Without<AALauncher>, Without<Wall>),
     >,
     mut aa_launchers: Query<
         (&Transform, &mut Health),
-        (With<AALauncher>, Without<PendingExplosion>, Without<PlayerBase>),
+        (With<AALauncher>, Without<PendingExplosion>, Without<PlayerBase>, Without<Wall>),
+    >,
+    mut walls: Query<
+        (&Transform, &Sprite, &mut Health),
+        (With<Wall>, Without<PendingExplosion>, Without<PlayerBase>, Without<AALauncher>),
     >,
 ) {
     for (entity, transform, explosion) in &pending {
@@ -1614,6 +1688,26 @@ fn process_pending_explosions(
 
                 let nearest_x = pos.x.clamp(aa_pos.x - half_size, aa_pos.x + half_size);
                 let nearest_y = pos.y.clamp(aa_pos.y - half_size, aa_pos.y + half_size);
+                let nearest_point = Vec2::new(nearest_x, nearest_y);
+                let distance = pos.distance(nearest_point);
+
+                if distance <= 0.0 {
+                    health.take_damage(explosion.damage);
+                } else if distance < explosion.blast_radius {
+                    let damage_factor = 1.0 - (distance / explosion.blast_radius);
+                    health.take_damage(explosion.damage * damage_factor);
+                }
+            }
+
+            // Apply blast damage to walls
+            for (wall_transform, wall_sprite, mut health) in &mut walls {
+                let wall_pos = wall_transform.translation.truncate();
+                let wall_size = wall_sprite.custom_size.unwrap_or(Vec2::splat(40.0));
+                let half_w = wall_size.x / 2.0;
+                let half_h = wall_size.y / 2.0;
+
+                let nearest_x = pos.x.clamp(wall_pos.x - half_w, wall_pos.x + half_w);
+                let nearest_y = pos.y.clamp(wall_pos.y - half_h, wall_pos.y + half_h);
                 let nearest_point = Vec2::new(nearest_x, nearest_y);
                 let distance = pos.distance(nearest_point);
 
@@ -1956,23 +2050,25 @@ fn update_falling_entities(
 }
 
 fn update_health_bars(
-    bases: Query<(Entity, &Transform, &Health), (With<PlayerBase>, Without<AALauncher>)>,
-    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<PlayerBase>)>,
+    bases: Query<(Entity, &Transform, &Health), (With<PlayerBase>, Without<AALauncher>, Without<Wall>)>,
+    aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<PlayerBase>, Without<Wall>)>,
+    walls: Query<(Entity, &Transform, &Sprite, &Health), (With<Wall>, Without<PlayerBase>, Without<AALauncher>)>,
     mut health_bars: Query<
         (&mut Text2d, &mut Transform, &HealthBar),
         (
             Without<PlayerBase>,
             Without<HealthBarBackground>,
             Without<AALauncher>,
+            Without<Wall>,
         ),
     >,
     mut health_bar_backgrounds: Query<
         (&mut Transform, &HealthBarBackground),
-        (Without<PlayerBase>, Without<HealthBar>, Without<AALauncher>),
+        (Without<PlayerBase>, Without<HealthBar>, Without<AALauncher>, Without<Wall>),
     >,
 ) {
     for (mut text, mut bar_transform, health_bar) in &mut health_bars {
-        // Find the owner (base or AA launcher)
+        // Find the owner (base, AA launcher, or wall)
         if let Some((_, owner_transform, health, size)) = bases
             .iter()
             .find(|(e, _, _)| *e == health_bar.owner)
@@ -1982,6 +2078,15 @@ fn update_health_bars(
                     .iter()
                     .find(|(e, _, _)| *e == health_bar.owner)
                     .map(|(e, t, h)| (e, t, h, Buildable::AALauncher.size()))
+            })
+            .or_else(|| {
+                walls
+                    .iter()
+                    .find(|(e, _, _, _)| *e == health_bar.owner)
+                    .map(|(e, t, sprite, h)| {
+                        let size = sprite.custom_size.unwrap_or(Vec2::splat(40.0)).y;
+                        (e, t, h, size)
+                    })
             })
         {
             // Update text
@@ -2005,6 +2110,15 @@ fn update_health_bars(
                     .iter()
                     .find(|(e, _, _)| *e == bg.owner)
                     .map(|(_, t, _)| ((), t, Buildable::AALauncher.size()))
+            })
+            .or_else(|| {
+                walls
+                    .iter()
+                    .find(|(e, _, _, _)| *e == bg.owner)
+                    .map(|(_, t, sprite, _)| {
+                        let size = sprite.custom_size.unwrap_or(Vec2::splat(40.0)).y;
+                        ((), t, size)
+                    })
             })
         {
             let health_bar_y = owner_transform.translation.y - size / 2.0 - 20.0;
@@ -2030,30 +2144,44 @@ fn check_base_destruction(mut game_state: ResMut<GameState>, bases: Query<(&Play
     }
 }
 
-fn check_aa_destruction(
+fn check_structure_destruction(
     mut commands: Commands,
-    aa_launchers: Query<(Entity, &Health), With<AALauncher>>,
+    aa_launchers: Query<(Entity, &Health), (With<AALauncher>, Without<Wall>)>,
+    walls: Query<(Entity, &Health), (With<Wall>, Without<AALauncher>)>,
     health_bars: Query<(Entity, &HealthBar)>,
     health_bar_backgrounds: Query<(Entity, &HealthBarBackground)>,
 ) {
+    // Check AA launchers
     for (entity, health) in &aa_launchers {
         if health.is_dead() {
-            // Despawn the AA launcher
             commands.entity(entity).despawn();
+            despawn_health_bar(&mut commands, entity, &health_bars, &health_bar_backgrounds);
+        }
+    }
 
-            // Despawn associated health bar
-            for (bar_entity, bar) in &health_bars {
-                if bar.owner == entity {
-                    commands.entity(bar_entity).despawn();
-                }
-            }
+    // Check walls
+    for (entity, health) in &walls {
+        if health.is_dead() {
+            commands.entity(entity).despawn();
+            despawn_health_bar(&mut commands, entity, &health_bars, &health_bar_backgrounds);
+        }
+    }
+}
 
-            // Despawn associated health bar background
-            for (bg_entity, bg) in &health_bar_backgrounds {
-                if bg.owner == entity {
-                    commands.entity(bg_entity).despawn();
-                }
-            }
+fn despawn_health_bar(
+    commands: &mut Commands,
+    owner: Entity,
+    health_bars: &Query<(Entity, &HealthBar)>,
+    health_bar_backgrounds: &Query<(Entity, &HealthBarBackground)>,
+) {
+    for (bar_entity, bar) in health_bars {
+        if bar.owner == owner {
+            commands.entity(bar_entity).despawn();
+        }
+    }
+    for (bg_entity, bg) in health_bar_backgrounds {
+        if bg.owner == owner {
+            commands.entity(bg_entity).despawn();
         }
     }
 }
@@ -2267,6 +2395,7 @@ fn spawn_player_bases(
                 PlayerBase { player },
                 Health::new(PLAYER_BASE_HEALTH),
                 FallsWithGravity { size: PLAYER_BASE_SIZE },
+                ExtendsBuildArea { player },
             ))
             .id();
 
