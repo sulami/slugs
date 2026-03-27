@@ -204,6 +204,8 @@ impl Player {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Weapon {
     Artillery,
+    ClusterGrenade,
+    ClusterSubmunition,
 }
 
 struct WeaponStats {
@@ -218,12 +220,29 @@ impl Weapon {
                 damage: 10.0,
                 blast_radius: 100.0,
             },
+            Weapon::ClusterGrenade => WeaponStats {
+                damage: 0.0, // Main grenade doesn't explode
+                blast_radius: 0.0,
+            },
+            Weapon::ClusterSubmunition => WeaponStats {
+                damage: 4.0,
+                blast_radius: 50.0,
+            },
         }
     }
 
     fn name(&self) -> &'static str {
         match self {
             Weapon::Artillery => "Artillery",
+            Weapon::ClusterGrenade => "Cluster",
+            Weapon::ClusterSubmunition => "Submunition",
+        }
+    }
+
+    fn is_selectable(&self) -> bool {
+        match self {
+            Weapon::Artillery | Weapon::ClusterGrenade => true,
+            Weapon::ClusterSubmunition => false,
         }
     }
 }
@@ -316,6 +335,7 @@ struct ChargeIndicatorWorld;
 struct Projectile {
     velocity: Vec2,
     weapon: Weapon,
+    prev_velocity_y: f32, // For apoapsis detection
 }
 
 #[derive(Component)]
@@ -402,6 +422,34 @@ fn setup_ui(mut commands: Commands) {
                 ))
                 .with_child((
                     Text::new("Artillery"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+
+            // Cluster grenade button
+            parent
+                .spawn((
+                    Button,
+                    Interaction::None,
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(40.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
+                    WeaponButton {
+                        weapon: Weapon::ClusterGrenade,
+                    },
+                ))
+                .with_child((
+                    Text::new("Cluster"),
                     TextFont {
                         font_size: 16.0,
                         ..default()
@@ -626,17 +674,27 @@ fn update_weapon_tooltip(
         .find(|(interaction, _)| **interaction == Interaction::Hovered);
 
     if let Some((_, weapon_button)) = hovered {
-        let stats = weapon_button.weapon.stats();
-
         // Update text in child
         if let Some(child) = children.iter().next() {
             if let Ok(mut text) = text_query.get_mut(child) {
-                **text = format!(
-                    "{}\nDamage: {}\nBlast Radius: {}",
-                    weapon_button.weapon.name(),
-                    stats.damage,
-                    stats.blast_radius
-                );
+                // Special handling for cluster grenade - show submunition stats
+                if weapon_button.weapon == Weapon::ClusterGrenade {
+                    let sub_stats = Weapon::ClusterSubmunition.stats();
+                    **text = format!(
+                        "{}\n5x Submunitions\nDamage: {} each\nBlast Radius: {}",
+                        weapon_button.weapon.name(),
+                        sub_stats.damage,
+                        sub_stats.blast_radius
+                    );
+                } else {
+                    let stats = weapon_button.weapon.stats();
+                    **text = format!(
+                        "{}\nDamage: {}\nBlast Radius: {}",
+                        weapon_button.weapon.name(),
+                        stats.damage,
+                        stats.blast_radius
+                    );
+                }
             }
         }
 
@@ -741,7 +799,11 @@ fn handle_aiming(
                 ..default()
             },
             Transform::from_xyz(start.x, start.y, 2.0),
-            Projectile { velocity, weapon },
+            Projectile {
+                velocity,
+                weapon,
+                prev_velocity_y: velocity.y,
+            },
         ));
 
         aiming_state.charging = false;
@@ -932,7 +994,7 @@ fn update_projectiles(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
-    mut projectiles: Query<(Entity, &mut Transform, &mut Projectile)>,
+    mut projectiles: Query<(Entity, &mut Transform, &mut Projectile, &Sprite)>,
     mut player_bases: Query<(Entity, &Transform, &PlayerBase, &mut Health), Without<Projectile>>,
 ) {
     if game_state.phase != TurnPhase::ProjectileInFlight {
@@ -941,8 +1003,15 @@ fn update_projectiles(
 
     let dt = time.delta_secs();
     let half_width = WORLD_WIDTH / 2.0;
+    let mut rng = rand::rng();
 
-    for (entity, mut transform, mut projectile) in &mut projectiles {
+    // Collect entities to despawn and submunitions to spawn (to avoid borrow issues)
+    let mut to_despawn = Vec::new();
+    let mut submunitions_to_spawn = Vec::new();
+
+    for (entity, mut transform, mut projectile, sprite) in &mut projectiles {
+        let prev_vel_y = projectile.prev_velocity_y;
+
         // Apply gravity
         projectile.velocity.y -= GRAVITY * dt;
 
@@ -952,11 +1021,40 @@ fn update_projectiles(
 
         let pos = transform.translation.truncate();
 
+        // Check for apoapsis (velocity.y crosses from positive to negative)
+        if projectile.weapon == Weapon::ClusterGrenade
+            && prev_vel_y >= 0.0
+            && projectile.velocity.y < 0.0
+        {
+            // Split into submunitions
+            let base_velocity = projectile.velocity;
+            let color = sprite.color;
+
+            for i in 0..5 {
+                // Spread angle: -20 to +20 degrees from current direction
+                let angle_offset = ((i as f32 - 2.0) / 2.0) * 0.35; // ~20 degrees
+                let random_offset = rng.random_range(-0.1..0.1);
+                let total_offset = angle_offset + random_offset;
+
+                let speed_variation = rng.random_range(0.8..1.2);
+                let rotated_velocity = Vec2::new(
+                    base_velocity.x * total_offset.cos() - base_velocity.y * total_offset.sin(),
+                    base_velocity.x * total_offset.sin() + base_velocity.y * total_offset.cos(),
+                ) * speed_variation;
+
+                submunitions_to_spawn.push((pos, rotated_velocity, color));
+            }
+
+            to_despawn.push(entity);
+            continue;
+        }
+
+        // Store current velocity for next frame's apoapsis check
+        projectile.prev_velocity_y = projectile.velocity.y;
+
         // Check world bounds
         if pos.x < -half_width || pos.x > half_width {
-            commands.entity(entity).despawn();
-            game_state.phase = TurnPhase::TurnEnding;
-            game_state.turn_end_timer = TURN_END_DELAY;
+            to_despawn.push(entity);
             continue;
         }
 
@@ -985,44 +1083,81 @@ fn update_projectiles(
         if hit_base_directly || terrain_hit {
             // Apply blast damage to terrain
             let stats = projectile.weapon.stats();
-            terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
+            if stats.blast_radius > 0.0 {
+                terrain_data.apply_damage(pos.x, pos.y, stats.damage, stats.blast_radius);
 
-            // Apply blast damage to all bases within blast radius
-            for (_, base_transform, _, mut health) in &mut player_bases {
-                let base_pos = base_transform.translation.truncate();
-                let distance = pos.distance(base_pos);
+                // Apply blast damage to all bases within blast radius
+                for (_, base_transform, _, mut health) in &mut player_bases {
+                    let base_pos = base_transform.translation.truncate();
+                    let distance = pos.distance(base_pos);
 
-                // Direct hit if impact touches the base (within half the base size)
-                let direct_hit_radius = PLAYER_BASE_SIZE / 2.0;
-                if distance <= direct_hit_radius {
-                    // Full damage for direct hit
-                    health.take_damage(stats.damage);
-                } else if distance < stats.blast_radius {
-                    // Damage falls off linearly with distance from edge of base
-                    let effective_distance = distance - direct_hit_radius;
-                    let effective_radius = stats.blast_radius - direct_hit_radius;
-                    let damage_factor = 1.0 - (effective_distance / effective_radius);
-                    let damage = stats.damage * damage_factor;
-                    health.take_damage(damage);
+                    // Direct hit if impact touches the base (within half the base size)
+                    let direct_hit_radius = PLAYER_BASE_SIZE / 2.0;
+                    if distance <= direct_hit_radius {
+                        // Full damage for direct hit
+                        health.take_damage(stats.damage);
+                    } else if distance < stats.blast_radius {
+                        // Damage falls off linearly with distance from edge of base
+                        let effective_distance = distance - direct_hit_radius;
+                        let effective_radius = stats.blast_radius - direct_hit_radius;
+                        let damage_factor = 1.0 - (effective_distance / effective_radius);
+                        let damage = stats.damage * damage_factor;
+                        health.take_damage(damage);
+                    }
                 }
+
+                // Spawn explosion
+                commands.spawn((
+                    Mesh2d(meshes.add(Circle::new(1.0))),
+                    MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(
+                        1.0, 0.6, 0.0, 1.0,
+                    )))),
+                    Transform::from_xyz(pos.x, pos.y, 2.0),
+                    Explosion {
+                        timer: 0.0,
+                        max_time: EXPLOSION_DURATION,
+                        max_radius: stats.blast_radius,
+                    },
+                ));
             }
 
-            // Spawn explosion
-            commands.spawn((
-                Mesh2d(meshes.add(Circle::new(1.0))),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgba(1.0, 0.6, 0.0, 1.0)))),
-                Transform::from_xyz(pos.x, pos.y, 2.0),
-                Explosion {
-                    timer: 0.0,
-                    max_time: EXPLOSION_DURATION,
-                    max_radius: stats.blast_radius,
-                },
-            ));
-
-            commands.entity(entity).despawn();
-            game_state.phase = TurnPhase::TurnEnding;
-            game_state.turn_end_timer = TURN_END_DELAY;
+            to_despawn.push(entity);
         }
+    }
+
+    // Calculate final projectile count before consuming vectors
+    let remaining_projectiles = projectiles.iter().count();
+    let despawn_count = to_despawn.len();
+    let spawn_count = submunitions_to_spawn.len();
+
+    // Despawn projectiles
+    for entity in to_despawn {
+        commands.entity(entity).despawn();
+    }
+
+    // Spawn submunitions
+    for (pos, velocity, color) in submunitions_to_spawn {
+        commands.spawn((
+            Sprite {
+                color,
+                custom_size: Some(Vec2::splat(PROJECTILE_RADIUS * 1.5)), // Slightly smaller
+                ..default()
+            },
+            Transform::from_xyz(pos.x, pos.y, 2.0),
+            Projectile {
+                velocity,
+                weapon: Weapon::ClusterSubmunition,
+                prev_velocity_y: velocity.y,
+            },
+        ));
+    }
+
+    // Only end turn when no projectiles remain (but not if we never had any -
+    // commands are deferred so projectile might not exist on spawn frame)
+    let final_count = remaining_projectiles - despawn_count + spawn_count;
+    if final_count == 0 && remaining_projectiles > 0 {
+        game_state.phase = TurnPhase::TurnEnding;
+        game_state.turn_end_timer = TURN_END_DELAY;
     }
 }
 
