@@ -1022,7 +1022,12 @@ fn handle_aiming(
             (aiming_state.charge_time + time.delta_secs()).min(MAX_CHARGE_TIME);
     }
 
-    if mouse_button.just_released(MouseButton::Left) && aiming_state.charging {
+    // Fire on mouse release OR when charge reaches 100%
+    let should_fire = aiming_state.charging
+        && (mouse_button.just_released(MouseButton::Left)
+            || aiming_state.charge_time >= MAX_CHARGE_TIME);
+
+    if should_fire {
         // Fire projectile
         let speed = (aiming_state.charge_time / MAX_CHARGE_TIME) * MAX_LAUNCH_SPEED;
         let velocity = aim_direction * speed;
