@@ -601,6 +601,7 @@ struct GameOverOverlay;
 #[derive(Component)]
 struct NewGameButton;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct ExitButton;
 
@@ -984,7 +985,8 @@ fn setup_ui(
                             TextColor(Color::WHITE),
                         ));
 
-                    // Exit button
+                    // Exit button (not shown on web)
+                    #[cfg(not(target_arch = "wasm32"))]
                     button_parent
                         .spawn((
                             Button,
@@ -1162,7 +1164,7 @@ fn update_weapon_tooltip(
         } else if weapon_button.weapon == Weapon::EMP {
             let stats = weapon_button.weapon.stats();
             Some(format!(
-                "{}\nDisables AA for {} turns\nBlast Radius: {}",
+                "{}\nDisables AA and shields for {} turns\nBlast Radius: {}",
                 weapon_button.weapon.name(),
                 EMP_DISABLE_TURNS,
                 stats.blast_radius
@@ -3451,8 +3453,11 @@ fn update_game_over_overlay(
 
 fn handle_game_over_buttons(
     new_game_query: Query<&Interaction, (Changed<Interaction>, With<NewGameButton>)>,
-    exit_query: Query<&Interaction, (Changed<Interaction>, With<ExitButton>)>,
-    mut app_exit: MessageWriter<AppExit>,
+    #[cfg(not(target_arch = "wasm32"))] exit_query: Query<
+        &Interaction,
+        (Changed<Interaction>, With<ExitButton>),
+    >,
+    #[cfg(not(target_arch = "wasm32"))] mut app_exit: MessageWriter<AppExit>,
     mut game_state: ResMut<GameState>,
     mut terrain_data: ResMut<TerrainData>,
     mut commands: Commands,
@@ -3465,7 +3470,8 @@ fn handle_game_over_buttons(
     health_bar_bg_query: Query<Entity, With<HealthBarBackground>>,
     explosion_query: Query<Entity, With<Explosion>>,
 ) {
-    // Handle exit button
+    // Handle exit button (not on web)
+    #[cfg(not(target_arch = "wasm32"))]
     for interaction in &exit_query {
         if *interaction == Interaction::Pressed {
             app_exit.write(AppExit::Success);
