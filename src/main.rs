@@ -1089,18 +1089,20 @@ fn update_projectiles(
                 // Apply blast damage to all bases within blast radius
                 for (_, base_transform, _, mut health) in &mut player_bases {
                     let base_pos = base_transform.translation.truncate();
-                    let distance = pos.distance(base_pos);
+                    let half_size = PLAYER_BASE_SIZE / 2.0;
 
-                    // Direct hit if impact touches the base (within half the base size)
-                    let direct_hit_radius = PLAYER_BASE_SIZE / 2.0;
-                    if distance <= direct_hit_radius {
-                        // Full damage for direct hit
+                    // Calculate distance to nearest point on the base (not center)
+                    let nearest_x = pos.x.clamp(base_pos.x - half_size, base_pos.x + half_size);
+                    let nearest_y = pos.y.clamp(base_pos.y - half_size, base_pos.y + half_size);
+                    let nearest_point = Vec2::new(nearest_x, nearest_y);
+                    let distance = pos.distance(nearest_point);
+
+                    if distance <= 0.0 {
+                        // Direct hit - impact is inside the base
                         health.take_damage(stats.damage);
                     } else if distance < stats.blast_radius {
                         // Damage falls off linearly with distance from edge of base
-                        let effective_distance = distance - direct_hit_radius;
-                        let effective_radius = stats.blast_radius - direct_hit_radius;
-                        let damage_factor = 1.0 - (effective_distance / effective_radius);
+                        let damage_factor = 1.0 - (distance / stats.blast_radius);
                         let damage = stats.damage * damage_factor;
                         health.take_damage(damage);
                     }
