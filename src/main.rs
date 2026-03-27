@@ -1196,119 +1196,8 @@ fn handle_game_over_buttons(
                 commands.entity(entity).despawn();
             }
 
-            // Generate new terrain (inline the logic here)
-            let mut rng = rand::rng();
-
-            let mut heights = vec![0.0f32; TERRAIN_SEGMENTS + 1];
-            heights[0] = rng.random_range(200.0..600.0);
-            heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
-
-            midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
-
-            terrain_data.heights = heights.clone();
-
-            let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
-            let half_width = WORLD_WIDTH / 2.0;
-            let half_height = WORLD_HEIGHT / 2.0;
-
-            let mut vertices = Vec::new();
-            let mut indices = Vec::new();
-
-            for i in 0..TERRAIN_SEGMENTS {
-                let x0 = i as f32 * segment_width - half_width;
-                let x1 = (i + 1) as f32 * segment_width - half_width;
-                let y0 = heights[i] - half_height;
-                let y1 = heights[i + 1] - half_height;
-                let bottom = -half_height;
-
-                let base = vertices.len() as u32;
-                vertices.push([x0, bottom, 0.0]);
-                vertices.push([x1, bottom, 0.0]);
-                vertices.push([x1, y1, 0.0]);
-                vertices.push([x0, y0, 0.0]);
-
-                indices.push(base);
-                indices.push(base + 1);
-                indices.push(base + 2);
-                indices.push(base);
-                indices.push(base + 2);
-                indices.push(base + 3);
-            }
-
-            let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vertices);
-            mesh.insert_indices(Indices::U32(indices));
-
-            commands.spawn((
-                Mesh2d(meshes.add(mesh)),
-                MeshMaterial2d(
-                    materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2))),
-                ),
-                Terrain,
-            ));
-
-            // Spawn player bases
-            let blue_segment = TERRAIN_SEGMENTS * 15 / 100;
-            let blue_x = blue_segment as f32 * segment_width - half_width;
-            let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
-
-            let blue_base = commands
-                .spawn((
-                    Sprite {
-                        color: Player::Blue.color(),
-                        custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
-                        ..default()
-                    },
-                    Transform::from_xyz(blue_x, blue_y, 1.0),
-                    PlayerBase {
-                        player: Player::Blue,
-                    },
-                    Health::new(PLAYER_BASE_HEALTH),
-                ))
-                .id();
-
-            // Blue health bar
-            commands.spawn((
-                Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
-                TextFont {
-                    font_size: 48.0,
-                    ..default()
-                },
-                TextColor(Player::Blue.color()),
-                Transform::from_xyz(blue_x, blue_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
-                HealthBar { owner: blue_base },
-            ));
-
-            let red_segment = TERRAIN_SEGMENTS * 85 / 100;
-            let red_x = red_segment as f32 * segment_width - half_width;
-            let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
-
-            let red_base = commands
-                .spawn((
-                    Sprite {
-                        color: Player::Red.color(),
-                        custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
-                        ..default()
-                    },
-                    Transform::from_xyz(red_x, red_y, 1.0),
-                    PlayerBase {
-                        player: Player::Red,
-                    },
-                    Health::new(PLAYER_BASE_HEALTH),
-                ))
-                .id();
-
-            // Red health bar
-            commands.spawn((
-                Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
-                TextFont {
-                    font_size: 48.0,
-                    ..default()
-                },
-                TextColor(Player::Red.color()),
-                Transform::from_xyz(red_x, red_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
-                HealthBar { owner: red_base },
-            ));
+            // Generate new world
+            spawn_world(&mut commands, &mut meshes, &mut materials, &mut terrain_data);
         }
     }
 }
@@ -1319,19 +1208,37 @@ fn generate_terrain(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut terrain_data: ResMut<TerrainData>,
 ) {
-    let mut rng = rand::rng();
+    spawn_world(&mut commands, &mut meshes, &mut materials, &mut terrain_data);
+}
 
-    // Generate terrain heights using midpoint displacement
+fn spawn_world(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    terrain_data: &mut ResMut<TerrainData>,
+) {
+    let heights = generate_terrain_heights();
+    terrain_data.heights = heights.clone();
+
+    spawn_terrain_mesh(commands, meshes, materials, &heights);
+    spawn_player_bases(commands, &heights);
+}
+
+fn generate_terrain_heights() -> Vec<f32> {
+    let mut rng = rand::rng();
     let mut heights = vec![0.0f32; TERRAIN_SEGMENTS + 1];
     heights[0] = rng.random_range(200.0..600.0);
     heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
-
     midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
+    heights
+}
 
-    // Store heights for later use
-    terrain_data.heights = heights.clone();
-
-    // Build the terrain mesh
+fn spawn_terrain_mesh(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+    heights: &[f32],
+) {
     let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
     let half_width = WORLD_WIDTH / 2.0;
     let half_height = WORLD_HEIGHT / 2.0;
@@ -1369,74 +1276,42 @@ fn generate_terrain(
         MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2)))),
         Terrain,
     ));
+}
 
-    // Spawn player bases
+fn spawn_player_bases(commands: &mut Commands, heights: &[f32]) {
+    let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
     let half_width = WORLD_WIDTH / 2.0;
     let half_height = WORLD_HEIGHT / 2.0;
 
-    // Blue player on the left (around 15% from left edge)
-    let blue_segment = TERRAIN_SEGMENTS * 15 / 100;
-    let blue_x = blue_segment as f32 * segment_width - half_width;
-    let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+    for (player, segment_percent) in [(Player::Blue, 15), (Player::Red, 85)] {
+        let segment = TERRAIN_SEGMENTS * segment_percent / 100;
+        let x = segment as f32 * segment_width - half_width;
+        let y = heights[segment] - half_height + PLAYER_BASE_SIZE / 2.0;
 
-    let blue_base = commands
-        .spawn((
-            Sprite {
-                color: Player::Blue.color(),
-                custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+        let base_entity = commands
+            .spawn((
+                Sprite {
+                    color: player.color(),
+                    custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+                    ..default()
+                },
+                Transform::from_xyz(x, y, 1.0),
+                PlayerBase { player },
+                Health::new(PLAYER_BASE_HEALTH),
+            ))
+            .id();
+
+        commands.spawn((
+            Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
+            TextFont {
+                font_size: 48.0,
                 ..default()
             },
-            Transform::from_xyz(blue_x, blue_y, 1.0),
-            PlayerBase {
-                player: Player::Blue,
-            },
-            Health::new(PLAYER_BASE_HEALTH),
-        ))
-        .id();
-
-    // Blue health bar
-    commands.spawn((
-        Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
-        TextFont {
-            font_size: 48.0,
-            ..default()
-        },
-        TextColor(Player::Blue.color()),
-        Transform::from_xyz(blue_x, blue_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
-        HealthBar { owner: blue_base },
-    ));
-
-    // Red player on the right (around 85% from left edge)
-    let red_segment = TERRAIN_SEGMENTS * 85 / 100;
-    let red_x = red_segment as f32 * segment_width - half_width;
-    let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
-
-    let red_base = commands
-        .spawn((
-            Sprite {
-                color: Player::Red.color(),
-                custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
-                ..default()
-            },
-            Transform::from_xyz(red_x, red_y, 1.0),
-            PlayerBase {
-                player: Player::Red,
-            },
-            Health::new(PLAYER_BASE_HEALTH),
-        ))
-        .id();
-
-    // Red health bar
-    commands.spawn((
-        Text2d::new(format!("{}", PLAYER_BASE_HEALTH as i32)),
-        TextFont {
-            font_size: 48.0,
-            ..default()
-        },
-        TextColor(Player::Red.color()),
-        Transform::from_xyz(red_x, red_y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
-        HealthBar { owner: red_base },
-    ));
+            TextColor(player.color()),
+            Transform::from_xyz(x, y - PLAYER_BASE_SIZE / 2.0 - 25.0, 1.0),
+            HealthBar { owner: base_entity },
+        ));
+    }
 }
 
 fn camera_zoom(
