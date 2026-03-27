@@ -36,6 +36,15 @@ const GROUND_DAMAGE_RESISTANCE: f32 = 2.0;
 // Building settings
 const BUILD_RADIUS: f32 = 200.0;
 
+// AA Missile settings
+const AA_DETECTION_RANGE: f32 = 800.0; // Range at which AA detects incoming projectiles
+const AA_MISSILE_ACCELERATION: f32 = 800.0;
+const AA_MISSILE_MAX_SPEED: f32 = 600.0;
+const AA_MISSILE_TURN_RATE: f32 = 4.0; // Radians per second
+const AA_MISSILE_MAX_RANGE: f32 = 500.0;
+const AA_MISSILE_SIZE: f32 = 6.0;
+const AA_MISSILE_EXPLOSION_RADIUS: f32 = 30.0;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -71,12 +80,16 @@ fn main() {
             Update,
             (
                 update_projectiles,
+                aa_fire_missiles,
+                update_aa_missiles,
+                check_projectile_phase_end,
                 update_explosions,
                 rebuild_terrain_mesh,
                 update_falling_bases,
                 update_health_bars,
                 check_base_destruction,
                 check_aa_destruction,
+                reset_aa_launchers,
                 check_turn_end,
                 update_game_over_overlay,
                 handle_game_over_buttons,
@@ -377,6 +390,14 @@ struct BuildableAreaOverlay;
 #[derive(Component)]
 struct AALauncher {
     player: Player,
+    fired_this_turn: bool,
+}
+
+#[derive(Component)]
+struct AAMissile {
+    velocity: Vec2,
+    target: Entity,
+    distance_traveled: f32,
 }
 
 #[derive(Component)]
@@ -970,6 +991,7 @@ fn handle_aiming(
 
 fn handle_building(
     mut commands: Commands,
+    mut gizmos: Gizmos,
     mut game_state: ResMut<GameState>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
@@ -978,10 +1000,29 @@ fn handle_building(
     interaction_query: Query<&Interaction, With<Button>>,
     mut preview_query: Query<
         (&mut Transform, &mut Visibility, &mut Sprite),
-        (With<BuildPreview>, Without<MainCamera>, Without<PlayerBase>, Without<AALauncher>),
+        (
+            With<BuildPreview>,
+            Without<MainCamera>,
+            Without<PlayerBase>,
+            Without<AALauncher>,
+        ),
     >,
-    player_bases: Query<(&Transform, &PlayerBase), (Without<BuildPreview>, Without<MainCamera>, Without<AALauncher>)>,
-    aa_launchers: Query<(&Transform, &AALauncher), (Without<BuildPreview>, Without<MainCamera>, Without<PlayerBase>)>,
+    player_bases: Query<
+        (&Transform, &PlayerBase),
+        (
+            Without<BuildPreview>,
+            Without<MainCamera>,
+            Without<AALauncher>,
+        ),
+    >,
+    aa_launchers: Query<
+        (&Transform, &AALauncher),
+        (
+            Without<BuildPreview>,
+            Without<MainCamera>,
+            Without<PlayerBase>,
+        ),
+    >,
 ) {
     let Ok((mut preview_transform, mut preview_visibility, mut preview_sprite)) =
         preview_query.single_mut()
@@ -1056,6 +1097,15 @@ fn handle_building(
     }
     *preview_visibility = Visibility::Visible;
 
+    // Draw AA detection range preview
+    if matches!(buildable, Buildable::AALauncher) {
+        gizmos.circle_2d(
+            placement_pos,
+            AA_DETECTION_RANGE,
+            Color::srgba(1.0, 1.0, 1.0, 0.5),
+        );
+    }
+
     // Don't place if clicking on UI
     let clicking_ui = interaction_query.iter().any(|i| *i != Interaction::None);
 
@@ -1074,6 +1124,7 @@ fn handle_building(
                 Transform::from_xyz(placement_pos.x, placement_pos.y, 1.0),
                 AALauncher {
                     player: game_state.current_player,
+                    fired_this_turn: false,
                 },
                 Health::new(buildable.health()),
             ))
@@ -1137,7 +1188,12 @@ fn draw_buildable_area(
     // Draw filled circles for each friendly structure's build radius
     // Using multiple concentric circles to create a filled effect
     let player_color = game_state.current_player.color().to_srgba();
-    let fill_color = Color::srgba(player_color.red, player_color.green, player_color.blue, 0.15);
+    let fill_color = Color::srgba(
+        player_color.red,
+        player_color.green,
+        player_color.blue,
+        0.15,
+    );
 
     for pos in &friendly_positions {
         // Draw filled area using concentric circles
@@ -1529,6 +1585,21 @@ fn update_projectiles(
     // commands are deferred so projectile might not exist on spawn frame)
     let final_count = remaining_projectiles - despawn_count + spawn_count;
     if final_count == 0 && remaining_projectiles > 0 {
+        // Note: AA missiles are checked separately in check_projectile_phase_end
+    }
+}
+
+fn check_projectile_phase_end(
+    mut game_state: ResMut<GameState>,
+    projectiles: Query<Entity, With<Projectile>>,
+    aa_missiles: Query<Entity, With<AAMissile>>,
+) {
+    if game_state.phase != TurnPhase::ProjectileInFlight {
+        return;
+    }
+
+    // End turn when both projectiles and AA missiles are gone
+    if projectiles.is_empty() && aa_missiles.is_empty() {
         game_state.phase = TurnPhase::TurnEnding;
         game_state.turn_end_timer = TURN_END_DELAY;
     }
@@ -1567,6 +1638,202 @@ fn update_explosions(
             let green = 0.6 * (1.0 - progress);
             material.color = Color::srgba(1.0, green, 0.0, alpha);
         }
+    }
+}
+
+fn aa_fire_missiles(
+    mut commands: Commands,
+    game_state: Res<GameState>,
+    mut aa_launchers: Query<(&Transform, &mut AALauncher)>,
+    projectiles: Query<(Entity, &Transform), With<Projectile>>,
+) {
+    // Only fire during projectile flight phase
+    if game_state.phase != TurnPhase::ProjectileInFlight {
+        return;
+    }
+
+    for (aa_transform, mut aa_launcher) in &mut aa_launchers {
+        // Only fire at enemy projectiles (AA belongs to player who isn't current)
+        if aa_launcher.player == game_state.current_player {
+            continue;
+        }
+
+        // Only fire once per turn
+        if aa_launcher.fired_this_turn {
+            continue;
+        }
+
+        let aa_pos = aa_transform.translation.truncate();
+
+        // Find closest enemy projectile in range
+        let mut closest: Option<(Entity, f32)> = None;
+        for (proj_entity, proj_transform) in &projectiles {
+            let proj_pos = proj_transform.translation.truncate();
+            let distance = aa_pos.distance(proj_pos);
+
+            if distance <= AA_DETECTION_RANGE {
+                if closest.is_none() || distance < closest.unwrap().1 {
+                    closest = Some((proj_entity, distance));
+                }
+            }
+        }
+
+        // Fire at closest target
+        if let Some((target_entity, _)) = closest {
+            let target_pos = projectiles
+                .get(target_entity)
+                .map(|(_, t)| t.translation.truncate())
+                .unwrap();
+
+            // Initial velocity pointing toward target
+            let direction = (target_pos - aa_pos).normalize_or_zero();
+            let initial_speed = 100.0;
+
+            commands.spawn((
+                Sprite {
+                    color: aa_launcher.player.color(),
+                    custom_size: Some(Vec2::new(AA_MISSILE_SIZE, AA_MISSILE_SIZE * 2.0)),
+                    ..default()
+                },
+                Transform::from_xyz(aa_pos.x, aa_pos.y + Buildable::AALauncher.size() / 2.0, 3.0)
+                    .with_rotation(Quat::from_rotation_z(
+                        direction.y.atan2(direction.x) - std::f32::consts::FRAC_PI_2,
+                    )),
+                AAMissile {
+                    velocity: direction * initial_speed,
+                    target: target_entity,
+                    distance_traveled: 0.0,
+                },
+            ));
+
+            aa_launcher.fired_this_turn = true;
+        }
+    }
+}
+
+fn update_aa_missiles(
+    mut commands: Commands,
+    game_state: Res<GameState>,
+    time: Res<Time>,
+    mut missiles: Query<(Entity, &mut Transform, &mut AAMissile, &mut Sprite)>,
+    projectiles: Query<&Transform, (With<Projectile>, Without<AAMissile>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    if game_state.phase != TurnPhase::ProjectileInFlight {
+        return;
+    }
+
+    let dt = time.delta_secs();
+
+    for (entity, mut transform, mut missile, _sprite) in &mut missiles {
+        // Check if target still exists
+        let target_pos = if let Ok(target_transform) = projectiles.get(missile.target) {
+            target_transform.translation.truncate()
+        } else {
+            // Target destroyed, despawn missile
+            commands.entity(entity).despawn();
+            continue;
+        };
+
+        let pos = transform.translation.truncate();
+
+        // Calculate desired direction to target
+        let to_target = target_pos - pos;
+        let desired_direction = to_target.normalize_or_zero();
+
+        // Current direction from velocity
+        let current_speed = missile.velocity.length();
+        let current_direction = if current_speed > 0.1 {
+            missile.velocity / current_speed
+        } else {
+            desired_direction
+        };
+
+        // Calculate angle difference and apply turn rate limit
+        let current_angle = current_direction.y.atan2(current_direction.x);
+        let desired_angle = desired_direction.y.atan2(desired_direction.x);
+        let mut angle_diff = desired_angle - current_angle;
+
+        // Normalize angle difference to [-PI, PI]
+        while angle_diff > std::f32::consts::PI {
+            angle_diff -= 2.0 * std::f32::consts::PI;
+        }
+        while angle_diff < -std::f32::consts::PI {
+            angle_diff += 2.0 * std::f32::consts::PI;
+        }
+
+        // Apply turn rate limit
+        let max_turn = AA_MISSILE_TURN_RATE * dt;
+        let actual_turn = angle_diff.clamp(-max_turn, max_turn);
+        let new_angle = current_angle + actual_turn;
+
+        let new_direction = Vec2::new(new_angle.cos(), new_angle.sin());
+
+        // Accelerate
+        let new_speed = (current_speed + AA_MISSILE_ACCELERATION * dt).min(AA_MISSILE_MAX_SPEED);
+        missile.velocity = new_direction * new_speed;
+
+        // Update position
+        let movement = missile.velocity * dt;
+        transform.translation.x += movement.x;
+        transform.translation.y += movement.y;
+        missile.distance_traveled += movement.length();
+
+        // Update rotation to face direction of travel
+        transform.rotation = Quat::from_rotation_z(new_angle - std::f32::consts::FRAC_PI_2);
+
+        // Check if exceeded max range
+        if missile.distance_traveled > AA_MISSILE_MAX_RANGE {
+            // Explode harmlessly
+            commands.spawn((
+                Mesh2d(meshes.add(Circle::new(1.0))),
+                MeshMaterial2d(
+                    materials.add(ColorMaterial::from_color(Color::srgba(0.8, 0.8, 0.2, 1.0))),
+                ),
+                Transform::from_xyz(transform.translation.x, transform.translation.y, 2.0),
+                Explosion {
+                    timer: 0.0,
+                    max_time: EXPLOSION_DURATION * 0.5,
+                    max_radius: AA_MISSILE_EXPLOSION_RADIUS * 0.5,
+                },
+            ));
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        // Check collision with target
+        let distance_to_target = to_target.length();
+        if distance_to_target < AA_MISSILE_EXPLOSION_RADIUS {
+            // Hit! Spawn explosion and destroy both missile and projectile
+            commands.spawn((
+                Mesh2d(meshes.add(Circle::new(1.0))),
+                MeshMaterial2d(
+                    materials.add(ColorMaterial::from_color(Color::srgba(0.8, 0.8, 0.2, 1.0))),
+                ),
+                Transform::from_xyz(transform.translation.x, transform.translation.y, 2.0),
+                Explosion {
+                    timer: 0.0,
+                    max_time: EXPLOSION_DURATION,
+                    max_radius: AA_MISSILE_EXPLOSION_RADIUS,
+                },
+            ));
+
+            // Destroy the projectile
+            commands.entity(missile.target).despawn();
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+fn reset_aa_launchers(game_state: Res<GameState>, mut aa_launchers: Query<&mut AALauncher>) {
+    // Reset fired_this_turn when turn ends
+    if game_state.phase != TurnPhase::Aiming {
+        return;
+    }
+
+    for mut aa_launcher in &mut aa_launchers {
+        aa_launcher.fired_this_turn = false;
     }
 }
 
@@ -1657,7 +1924,11 @@ fn update_health_bars(
     aa_launchers: Query<(Entity, &Transform, &Health), (With<AALauncher>, Without<PlayerBase>)>,
     mut health_bars: Query<
         (&mut Text2d, &mut Transform, &HealthBar),
-        (Without<PlayerBase>, Without<HealthBarBackground>, Without<AALauncher>),
+        (
+            Without<PlayerBase>,
+            Without<HealthBarBackground>,
+            Without<AALauncher>,
+        ),
     >,
     mut health_bar_backgrounds: Query<
         (&mut Transform, &HealthBarBackground),
