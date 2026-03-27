@@ -12,9 +12,11 @@ const WORLD_HEIGHT: f32 = 2160.0;
 const TERRAIN_SEGMENTS: usize = 384;
 
 // Camera settings
-const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 4.0;
 const ZOOM_SPEED: f32 = 0.1;
+
+// Player settings
+const PLAYER_BASE_SIZE: f32 = 40.0;
 
 fn main() {
     App::new()
@@ -26,13 +28,68 @@ fn main() {
             }),
             ..default()
         }))
-        .add_systems(Startup, (setup_camera, generate_terrain))
-        .add_systems(Update, (camera_zoom, camera_pan))
+        .init_resource::<GameState>()
+        .init_resource::<TerrainData>()
+        .add_systems(Startup, (setup_camera, generate_terrain, setup_ui))
+        .add_systems(Update, (camera_zoom, camera_pan, update_turn_indicator))
         .run();
 }
 
+// Resources
+#[derive(Resource, Default)]
+struct TerrainData {
+    heights: Vec<f32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Player {
+    Blue,
+    Red,
+}
+
+impl Player {
+    fn color(&self) -> Color {
+        match self {
+            Player::Blue => Color::srgb(0.2, 0.4, 0.8),
+            Player::Red => Color::srgb(0.8, 0.2, 0.2),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Player::Blue => "Blue",
+            Player::Red => "Red",
+        }
+    }
+}
+
+#[derive(Resource)]
+struct GameState {
+    current_player: Player,
+}
+
+impl Default for GameState {
+    fn default() -> Self {
+        Self {
+            current_player: Player::Blue,
+        }
+    }
+}
+
+// Components
 #[derive(Component)]
 struct MainCamera;
+
+#[derive(Component)]
+struct Terrain;
+
+#[derive(Component)]
+struct PlayerBase {
+    player: Player,
+}
+
+#[derive(Component)]
+struct TurnIndicator;
 
 fn setup_camera(mut commands: Commands) {
     // Start zoomed out to see the whole world
@@ -44,13 +101,43 @@ fn setup_camera(mut commands: Commands) {
     ));
 }
 
-#[derive(Component)]
-struct Terrain;
+fn setup_ui(mut commands: Commands) {
+    commands.spawn((
+        Text::new("Blue's Turn"),
+        TextFont {
+            font_size: 32.0,
+            ..default()
+        },
+        TextColor(Player::Blue.color()),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Px(10.0),
+            ..default()
+        },
+        TurnIndicator,
+    ));
+}
+
+fn update_turn_indicator(
+    game_state: Res<GameState>,
+    mut query: Query<(&mut Text, &mut TextColor), With<TurnIndicator>>,
+) {
+    if !game_state.is_changed() {
+        return;
+    }
+
+    for (mut text, mut color) in &mut query {
+        **text = format!("{}'s Turn", game_state.current_player.name());
+        *color = TextColor(game_state.current_player.color());
+    }
+}
 
 fn generate_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut terrain_data: ResMut<TerrainData>,
 ) {
     let mut rng = rand::rng();
 
@@ -60,6 +147,9 @@ fn generate_terrain(
     heights[TERRAIN_SEGMENTS] = rng.random_range(200.0..600.0);
 
     midpoint_displacement(&mut heights, 0, TERRAIN_SEGMENTS, 400.0, &mut rng);
+
+    // Store heights for later use
+    terrain_data.heights = heights.clone();
 
     // Build the terrain mesh
     let segment_width = WORLD_WIDTH / TERRAIN_SEGMENTS as f32;
@@ -98,6 +188,44 @@ fn generate_terrain(
         Mesh2d(meshes.add(mesh)),
         MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.2, 0.5, 0.2)))),
         Terrain,
+    ));
+
+    // Spawn player bases
+    let half_width = WORLD_WIDTH / 2.0;
+    let half_height = WORLD_HEIGHT / 2.0;
+
+    // Blue player on the left (around 15% from left edge)
+    let blue_segment = TERRAIN_SEGMENTS * 15 / 100;
+    let blue_x = blue_segment as f32 * segment_width - half_width;
+    let blue_y = heights[blue_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+
+    commands.spawn((
+        Sprite {
+            color: Player::Blue.color(),
+            custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+            ..default()
+        },
+        Transform::from_xyz(blue_x, blue_y, 1.0),
+        PlayerBase {
+            player: Player::Blue,
+        },
+    ));
+
+    // Red player on the right (around 85% from left edge)
+    let red_segment = TERRAIN_SEGMENTS * 85 / 100;
+    let red_x = red_segment as f32 * segment_width - half_width;
+    let red_y = heights[red_segment] - half_height + PLAYER_BASE_SIZE / 2.0;
+
+    commands.spawn((
+        Sprite {
+            color: Player::Red.color(),
+            custom_size: Some(Vec2::splat(PLAYER_BASE_SIZE)),
+            ..default()
+        },
+        Transform::from_xyz(red_x, red_y, 1.0),
+        PlayerBase {
+            player: Player::Red,
+        },
     ));
 }
 
